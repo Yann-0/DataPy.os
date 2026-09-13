@@ -75,11 +75,8 @@ class PyInit:
 
     def _reap_children(self, signum, frame):
         """Reap all zombie child processes (PID 1 responsibility)."""
-        while True:
-            try:
-                os.waitpid(-1, os.WNOHANG)
-            except ChildProcessError:
-                break
+        from boot.linux import reap_zombies
+        reap_zombies()
 
     def _handle_shutdown(self, signum, frame):
         """Handle shutdown.
