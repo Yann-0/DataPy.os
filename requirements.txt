@@ -1,0 +1,51 @@
+# PyOS NOVA v0.0007 — Dependencies
+# Install: pip install -e .          (core only)
+#          pip install -e ".[full]"  (everything)
+#
+# GPU LLM:
+#   CUDA:  CMAKE_ARGS="-DLLAMA_CUDA=on"    pip install llama-cpp-python
+#   Metal: CMAKE_ARGS="-DLLAMA_METAL=on"   pip install llama-cpp-python
+
+# Core
+psutil>=5.9.0
+numpy>=1.24.0
+
+# AI inference
+llama-cpp-python>=0.2.0
+pynvml>=11.0.0
+
+# Encryption
+cryptography>=41.0.0
+
+# Voice
+pyttsx3>=2.9.0
+SpeechRecognition>=3.10
+pyaudio>=0.2.11
+
+# SSH
+paramiko>=3.3.0
+
+# WebSocket
+websockets>=12.0
+
+# WASM
+wasmtime>=13.0.0
+
+# Compression (all optional — gzip stdlib fallback always works)
+zstandard>=0.21.0
+lz4>=4.3.0
+brotli>=1.1.0
+
+# Multilingual (optional — builtin dict + AI fallback always works)
+argostranslate>=1.9.0
+
+# RPi sensors
+smbus2>=0.4.3
+
+# Dev tools
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
+pytest-cov>=4.1.0
+ruff>=0.1.0
+mypy>=1.7.0
+Cython>=3.0.0

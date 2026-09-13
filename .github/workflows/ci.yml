@@ -1,0 +1,111 @@
+name: PyOS NOVA CI  (v0.0100)
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  NOVA_NO_AI: "1"
+
+jobs:
+  syntax:
+    name: Syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - run: |
+          python -c "
+          import py_compile,os,sys
+          errors=[]
+          for r,d,fs in os.walk('.'):
+            d[:] = [x for x in d if '__pycache__' not in x and '.git' not in x]
+            for f in fs:
+              if not f.endswith('.py'): continue
+              p=os.path.join(r,f)
+              try: py_compile.compile(p,doraise=True)
+              except py_compile.PyCompileError as e:
+                errors.append(str(e))
+                print(f'::error file={p}::{e}')
+          sys.exit(1 if errors else 0)
+          "
+
+  docstrings:
+    name: Docstring coverage ≥ 95%
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - run: |
+          python -c "
+          import ast,os,sys
+          miss=[]; total=0
+          for r,d,fs in os.walk('.'):
+            d[:] = [x for x in d if '__pycache__' not in x and '.git' not in x]
+            for f in fs:
+              if not f.endswith('.py'): continue
+              total+=1
+              try:
+                tree=ast.parse(open(os.path.join(r,f)).read())
+                if not ast.get_docstring(tree): miss.append(os.path.join(r,f))
+              except Exception: pass
+          pct=round((1-len(miss)/max(total,1))*100)
+          print(f'Coverage: {pct}% ({total-len(miss)}/{total})')
+          if pct<95: [print(m) for m in miss]; sys.exit(1)
+          "
+
+  test:
+    name: Tests — Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    needs: syntax
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "${{ matrix.python-version }}", cache: pip}
+      - run: pip install psutil numpy pytest pytest-asyncio pytest-timeout
+      - run: pip install -e . || pip install psutil numpy
+      - name: Run tests
+        run: python -m pytest tests/ -v --tb=short --timeout=60
+        env:
+          NOVA_DATA: /tmp/nova_${{ matrix.python-version }}
+
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11", cache: pip}
+      - run: pip install psutil numpy
+      - name: SOS + i18n + security
+        run: |
+          python -c "
+          import os,sys,tempfile
+          sys.path.insert(0,'.')
+          td=tempfile.mkdtemp()
+          os.environ['NOVA_DATA']=td
+          from store.sos import SemanticObjectStore
+          sos=SemanticObjectStore(db_path=os.path.join(td,'t.db'))
+          sos.write('/t/h.txt','Hello NOVA')
+          assert sos.read('/t/h.txt')=='Hello NOVA'
+          print('SOS: OK')
+          from i18n.engine import I18n
+          i=I18n(sos=sos); i.set_locale('fr')
+          assert i.t('Done')=='Terminé'
+          print('i18n: OK')
+          from security.capabilities import CapabilityStore,RIGHT_READ
+          caps=CapabilityStore(sos)
+          cap=caps.grant('/t/h.txt',{RIGHT_READ},owner='root')
+          assert caps.check(cap.token,RIGHT_READ,'/t/h.txt')
+          print('Capabilities: OK')
+          import shutil; shutil.rmtree(td)
+          print('All integration tests passed')
+          "

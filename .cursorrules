@@ -1,0 +1,141 @@
+# datapy.os — Cursor AI Rules
+# ==============================
+# These rules give Cursor complete context. Read before writing any code.
+
+## Project identity
+DataPy.os is a data-native OS: **data + Python + AI**, not a classical folder tree.
+Objects are addressed by OID, flat handles, tags, and links. Collections are
+semantic (tags/graph), never parent directories.
+
+Stack:
+  Host / Pi / UEFI
+    → Python runtime
+    → NovaKernel      (kernel/nova.py)
+    → DataPlane       (store/dataplane.py)  # secure CRUD — primary surface
+    → SOS             (store/sos.py)        # content-addressed SQLite WAL
+    → Shell / AI
+
+## Target platforms
+- Raspberry Pi 5 (ARM64) — primary, boots from USB
+- x86-64 UEFI PC — secondary
+- Any machine: `python3 main.py` (dev mode)
+
+## The ONE rule: never touch disk directly
+ALWAYS use `sos.write(path, content)` and `sos.read(path)`.
+NEVER use `open()` to store data persistently.
+The SOS IS the filesystem. SQLite WAL mode, content-addressed, versioned.
+
+## Subsystem map (all on kernel.*)
+```
+kernel.sos        SemanticObjectStore    store/sos.py
+kernel.ai         AIEngine (tiered LLM) ai/engine.py
+kernel.shell      NovaShell              shell/nova_shell.py
+kernel.watchdog   KernelWatchdog         kernel/watchdog.py
+kernel.search     SearchIndex            search/fast.py
+kernel.tenants    TenantManager          system/enterprise.py
+kernel.rbac       RBAC                   system/enterprise.py
+kernel.observe    Observability          system/enterprise.py
+kernel.plugins    PluginRegistry         plugins/registry.py
+kernel.discovery  ServiceDiscovery       net/discovery.py
+kernel.gateway    APIGateway             net/discovery.py
+kernel.dns        DNSServer              net/discovery.py
+kernel.models     ModelManager           ai/models.py
+kernel.finetuner  Finetuner              ai/models.py
+kernel.i18n       I18n                   i18n/engine.py
+kernel.raft       RaftNode               system/enterprise.py
+kernel.compliance ComplianceManager      system/enterprise.py
+kernel.cloud      CloudManifests         system/enterprise.py
+```
+
+## Adding a shell command (the most common task)
+```python
+# 1. In shell/nova_shell.py, inside _build_cmds():
+"mycommand": self._mycommand_cmd,
+
+# 2. Add the handler method:
+def _mycommand_cmd(self, args: list[str]) -> None:
+    """mycommand list|add|rm — one-line description."""
+    sub = args[0] if args else "list"
+    if sub == "list":
+        for item in self.kernel.something.list():
+            print(f"  {col(item.name,'cyan'):<25} {item.description}")
+    elif sub == "add" and len(args) > 1:
+        self.kernel.something.add(args[1])
+        self._ok(f"Added: {args[1]}")
+    else:
+        print("  Usage: mycommand list|add <name>|rm <name>")
+```
+
+Shell helpers: `self._ok(msg)`, `self._err(msg)`, `col(text, color)`.
+
+## Coding standards
+1. Module-level docstring on EVERY .py file (CI enforces 100%)
+2. Type annotations on all public functions
+3. `from __future__ import annotations` + TYPE_CHECKING for circular imports
+4. No bare `except:` — always `except Exception as exc:`
+5. `logging.getLogger("nova.module")` not `print()` for logs
+6. Line limit: 100 chars. Formatter: ruff.
+
+## SOS quick reference
+```python
+sos.write(path, content, kind="text", tags=["note"])  # create/update
+sos.read(path)           # returns content string
+sos.resolve(path)        # returns OID (SHA-256 hex)
+sos.exists(path)         # bool
+sos.listdir(path)        # list of child names
+sos.search("query")      # FTS5 full-text search
+sos.find_by_tag("tag")   # returns list of OIDs
+sos.mkdir(path)          # create directory node
+sos.remove(path)         # soft delete (version retained)
+```
+
+## AI engine tiers
+1. llama-cpp-python — GGUF model, GPU/CPU, full quality
+2. NanoLLM — fast, tiny, embedding-based
+3. RAG — retrieval from SOS, always available (NOVA_NO_AI=1 forces this)
+
+```python
+response = kernel.ai.ask("query", max_tokens=200)  # auto-selects tier
+kernel.ai.tier   # "llama" | "nano" | "rag"
+```
+
+## Current state (v0.0008)
+Working: SOS, shell (104 cmds), AI (llama/RAG), multi-tenancy, RBAC, GDPR,
+         mDNS, DNS, API gateway, plugin sandbox, Prometheus metrics,
+         K8s/Compose/Terraform manifests, 25-language i18n, Pi 5 USB boot,
+         262 pytest tests, GitHub Actions CI.
+
+Next priorities:
+- Wi-Fi management from Python shell
+- Framebuffer GUI (pure Python, no X11)
+- NOVA package format (native, not pip)
+- Multi-node SOS sync (CRDT already in net/crdt.py)
+- GPU inference optimisation for Pi 5 (VideoCore VII)
+
+## Run locally
+```bash
+python3 main.py            # full OS in terminal
+python3 main.py --no-ai    # no LLM, fast
+python3 main.py --cmd "ls /"
+pytest tests/ -v
+```
+
+## Build Pi 5 USB image
+```bash
+python3 build/build_pi5_nova.py   # downloads ~37 MB, outputs nova_pi5.img
+# Flash with Rufus → DD Image mode
+```
+
+## Environment variables
+NOVA_DATA  ~/.nova     SOS database + models directory
+NOVA_SRC   auto        Root of datapy.os source tree
+NOVA_MODEL auto        Path to GGUF model file
+NOVA_NO_AI unset       Set 1 to force RAG tier (fast startup)
+NOVA_LOG   info        debug / info / warning / error
+
+## What NOT to do
+- NEVER use open() for persistent data — always sos.write()
+- NEVER use print() for logging — use logging.getLogger()
+- NEVER hardcode ~/.nova paths — use os.environ.get("NOVA_DATA")
+- NEVER remove module docstrings (CI gate)
+- NEVER add Linux-only syscalls (code runs bare-metal on Pi)

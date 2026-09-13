@@ -1,0 +1,30 @@
+[project]
+name = "datapy-os"
+version = "0.0008"
+description = "Python-native operating system — Python is PID-1"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+
+[project.scripts]
+datapy = "main:main"
+
+[project.optional-dependencies]
+ai       = ["llama-cpp-python", "numpy"]
+search   = ["numpy"]
+ssh      = ["paramiko"]
+compress = ["zstandard", "lz4"]
+i18n     = ["argostranslate"]
+rpi      = ["gpiod", "smbus2"]
+dev      = ["pytest", "pytest-asyncio", "pytest-cov", "ruff", "psutil", "numpy"]
+full     = ["datapy-os[ai,search,ssh,compress,i18n]"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "F", "W", "I"]
+ignore = ["E501", "E731"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

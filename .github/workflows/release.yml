@@ -1,0 +1,76 @@
+# PyOS NOVA — Release Pipeline
+# ==============================
+# Triggered by a version tag: git tag v0.0009 && git push --tags
+# Builds the wheel, creates a GitHub Release, and uploads artifacts.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # needed for changelog generation
+
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+
+      - name: Install build dependencies
+        run: pip install build wheel pytest pytest-asyncio psutil numpy
+
+      - name: Gate — syntax + tests must pass
+        run: |
+          python3 -m compileall . -q
+          pytest tests/ --ignore=tests/bench.py -q \
+            --tb=short -x \
+            -e "NOVA_NO_AI=1" \
+            -e "NOVA_DATA=/tmp/nova_release_test"
+        env:
+          NOVA_NO_AI: "1"
+          NOVA_DATA:  /tmp/nova_release_test
+
+      - name: Extract version from tag
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
+
+      - name: Build Python wheel
+        run: python3 -m build --wheel --outdir dist/
+
+      - name: Build source archive
+        run: |
+          zip -r nova-${{ env.VERSION }}-source.zip . \
+            --exclude "*/__pycache__/*" "*.pyc" "*/.nova/*" \
+            "*.gguf" "*/.git/*" "*/dist/*" "*/.venv/*" \
+            "*.img" "*.iso" "build/BOOTX64.EFI" "build/python3.efi"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "PyOS NOVA ${{ env.VERSION }}"
+          body: |
+            ## PyOS NOVA ${{ env.VERSION }}
+
+            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md)
+            for full release notes.
+
+            ### Quick start
+            ```bash
+            pip install pyos-nova==${{ env.VERSION }}
+            # or
+            curl -sL https://nova-os.dev/install.sh | bash
+            ```
+
+            ### What's included
+            - Python wheel (importable library + `nova` CLI)
+            - Source archive (all 120+ Python files)
+          files: |
+            dist/*.whl
+            nova-${{ env.VERSION }}-source.zip
+          draft:      false
+          prerelease: ${{ contains(env.VERSION, 'a') || contains(env.VERSION, 'b') }}
