@@ -2,7 +2,8 @@
 *.db *.db-wal *.db-shm
 *.gguf *.bin *.pt *.safetensors
 models/ adapters/ downloads/
-__pycache__/ *.pyc *.pyo .pytest_cache/
+**/__pycache__/
+*.pyc *.pyo .pytest_cache/
 .coverage coverage.xml htmlcov/
 .venv/ venv/ .env
 *.img *.iso nova_*.zip
