@@ -16,11 +16,13 @@ commands as executed.
 
 ## Source identity (worktree)
 
+Draft continuation PR: https://github.com/Yann-0/DataPy.os/pull/2
+
 ```
 branch:  agent/datapy-remediation-2026-09-14
-tracks:  origin/agent/datapy-boot-review-2026-09-14 (PR #1)
-HEAD:    bdea1ad9cb764f815687e9174e6475cbf53e0f3f  (before local commits)
-PR #1:   https://github.com/Yann-0/DataPy.os/pull/1
+HEAD:    f119a7476589ffc1f578484276000a92fdb67b56  (plus later ledger-only commits)
+tree:    dd5c2bd41448a674a84bd6eaae500dec9e06cc17
+PR #1:   https://github.com/Yann-0/DataPy.os/pull/1  (left draft; not updated)
 main:    db99f6d5b7b921db978865fc16845f8a44a9235a
 ```
 

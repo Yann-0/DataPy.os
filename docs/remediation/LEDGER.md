@@ -2,9 +2,13 @@
 
 Working language: English. Continuation of
 [PR #1](https://github.com/Yann-0/DataPy.os/pull/1)
-(`bdea1ad9cb764f815687e9174e6475cbf53e0f3f`, tree
-`81865f199bfda72f2f8769c7954309a773e027bf`) on branch
-`agent/datapy-remediation-2026-09-14`.
+on branch `agent/datapy-remediation-2026-09-14`.
+
+Draft continuation PR: https://github.com/Yann-0/DataPy.os/pull/2
+
+HEAD at publication: `f119a7476589ffc1f578484276000a92fdb67b56`
+(tree `dd5c2bd41448a674a84bd6eaae500dec9e06cc17`). Further ledger-only
+commits may follow on the same branch.
 
 Historical audited `main`: `db99f6d5b7b921db978865fc16845f8a44a9235a`.
 PR #1 remained draft and unmerged at handoff.
