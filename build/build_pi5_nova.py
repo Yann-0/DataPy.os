@@ -247,7 +247,9 @@ def mount(src: str, dst: str, fstype: str, opts: str = "") -> None:
     if opts:
         cmd += ["-o", opts]
     cmd += [src, dst]
-    subprocess.run(cmd, stderr=subprocess.DEVNULL)
+    # Inherit the console: /dev/null may not exist until devtmpfs is mounted.
+    # Essential mount failures must stop boot instead of reporting success.
+    subprocess.run(cmd, check=True)
 
 
 def setup_filesystems() -> None:
@@ -436,31 +438,37 @@ class CPIOWriter:
         self._ino = 1
 
     def add_dir(self, path: str, mode: int = 0o040755):
-        self._entries.append((path.lstrip("/"), b"", mode))
+        self._entries.append((path.lstrip("/"), b"", mode, 0, 0))
 
     def add_file(self, path: str, data: bytes, mode: int = 0o100644):
-        self._entries.append((path.lstrip("/"), data, mode))
+        self._entries.append((path.lstrip("/"), data, mode, 0, 0))
 
     def add_symlink(self, path: str, target: str):
-        self._entries.append((path.lstrip("/"), target.encode(), 0o120777))
+        self._entries.append((path.lstrip("/"), target.encode(), 0o120777, 0, 0))
+
+    def add_device(self, path: str, major: int, minor: int,
+                   permissions: int = 0o600) -> None:
+        """Encode a character device without requiring host mknod privileges."""
+        self._entries.append((path.lstrip("/"), b"", 0o020000 | permissions, major, minor))
 
     def add_file_from_disk(self, cpio_path: str, disk_path: Path, mode: int = 0o100644):
         self.add_file(cpio_path, disk_path.read_bytes(), mode)
 
-    def _header(self, name: str, data: bytes, mode: int) -> bytes:
+    def _header(self, name: str, data: bytes, mode: int,
+                rdevmajor: int = 0, rdevminor: int = 0) -> bytes:
         nb = name.encode() + b"\x00"
         nl, dl = len(nb), len(data)
         self._ino += 1
         h8 = lambda n: f"{n:08x}".encode()
         hdr = (self.MAGIC + h8(self._ino) + h8(mode) + h8(0) + h8(0)
                + h8(1) + h8(int(time.time())) + h8(dl)
-               + h8(0) + h8(0) + h8(0) + h8(0) + h8(nl) + h8(0))
+               + h8(0) + h8(0) + h8(rdevmajor) + h8(rdevminor) + h8(nl) + h8(0))
         np = (4 - (110 + nl) % 4) % 4
         dp = (4 - dl % 4) % 4
         return hdr + nb + b"\x00" * np + data + b"\x00" * dp
 
     def build(self) -> bytes:
-        parts = [self._header(p, d, m) for p, d, m in self._entries]
+        parts = [self._header(*entry) for entry in self._entries]
         parts.append(self._header("TRAILER!!!", b"", 0))
         return b"".join(parts)
 
@@ -596,7 +604,8 @@ def build_initramfs(python_dir: Path, nova_source_zip: Path,
     cpio.add_file("etc/fstab",
         b"# PyOS NOVA fstab\ntmpfs /tmp tmpfs defaults 0 0\n")
     # /dev/console must exist before devtmpfs is mounted
-    cpio.add_file("dev/console", b"", 0o20600)
+    cpio.add_device("dev/console", 5, 1, permissions=0o600)
+    cpio.add_device("dev/null", 1, 3, permissions=0o666)
     # ld cache
     cpio.add_file("etc/ld.so.conf",
         b"/usr/local/lib\n/usr/local/lib/python3.12/lib-dynload\n")

@@ -1576,7 +1576,8 @@ class NovaShell:
 
         elif sub == "help" or (not args):
             print("  Usage:")
-            print(f"    {col('fix \'<problem>\'','cyan')}   — analyse + propose fixes")
+            fix_example = col("fix '<problem>'", "cyan")
+            print(f"    {fix_example}   — analyse + propose fixes")
             print(f"    {col('fix list','cyan')}             — show fix history")
             print(f"    {col('fix show <id>','cyan')}        — show fix details + outputs")
             print(f"    {col('fix rollback <id>','cyan')}    — roll back an applied fix")
