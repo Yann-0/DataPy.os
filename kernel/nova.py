@@ -37,7 +37,9 @@ All subsystems wired together.
 
 import os
 import hashlib
-import os, sys, time, threading
+import os, sys, time, threading, logging
+
+log = logging.getLogger("nova.kernel")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path: sys.path.insert(0, ROOT)
@@ -200,6 +202,10 @@ class NovaKernel:
         self.data       = DataPlane(
             self.sos, self.caps, enforce=False, audit=self.audit
         )
+        self.data.load_policy()
+        self.api_server.dataplane = self.data
+        self.file_server.host = "127.0.0.1"
+        self.file_server.dataplane = self.data
 
         _p("data mgmt")
         # Data management
@@ -424,6 +430,12 @@ class NovaKernel:
     def shutdown(self) -> None:
         """Flush SOS WAL and stop background services cleanly."""
         try:
+            if getattr(self, "audit", None) and hasattr(self.audit, "flush"):
+                self.audit.flush()
+        except Exception as exc:
+            log.error("audit flush failed during shutdown: %s", exc)
+            raise
+        try:
             if getattr(self, "watchdog", None):
                 self.watchdog.stop()
         except Exception:
@@ -453,19 +465,17 @@ class NovaKernel:
         path: Path.
         """
     def sys_read(self, path):
-        """Read via DataPlane handle when possible, else SOS path."""
-        try:
+        """Read via DataPlane. Legacy SOS paths are denied under lockdown."""
+        from store.dataplane import DataPlaneError
+        if "/" not in str(path).lstrip("@"):
             return self.data.get(path).content
-        except Exception:
-            return self.sos.read(path)
-    """Sys write.
+        if self.data.enforce:
+            raise DataPlaneError("legacy path access denied under lockdown")
+        return self.sos.read(path)
 
-        Args:
-        path: Path.
-        c: C.
-        """
     def sys_write(self, path, c, **kw):
-        """Write via DataPlane for flat handles; SOS path otherwise."""
+        """Write via DataPlane. Legacy SOS paths are denied under lockdown."""
+        from store.dataplane import DataPlaneError
         if "/" not in str(path).lstrip("@"):
             rec = self.data.put(path, c, **kw)
             try:
@@ -473,23 +483,19 @@ class NovaKernel:
             except Exception:
                 pass
             return rec.oid
-        oid = self.sos.write(path, c, **kw)
-        try:
-            self.search.index_now(path)
-        except Exception:
-            pass
-        return oid
-    def sys_exec(self, path, args=None):
-        """Sys exec.
+        if self.data.enforce:
+            raise DataPlaneError("legacy path access denied under lockdown")
+        return self.sos.write(path, c, **kw)
 
-            Args:
-            path: Path.
-            args: Args, defaults to None.
-            """
-        try:
-            content = self.data.get(path).content
-        except Exception:
+    def sys_exec(self, path, args=None):
+        """Execute a DataPlane object. Untrusted SOS fallback is not permitted."""
+        from store.dataplane import DataPlaneError
+        if "/" in str(path).lstrip("@"):
+            if self.data.enforce:
+                raise DataPlaneError("legacy path exec denied under lockdown")
             content = self.sos.read(path)
+        else:
+            content = self.data.get(path).content
         ns = {"__name__":"__main__","kernel":self,"sos":self.sos,"data":self.data}
         exec(compile(content, path, "exec"), ns)
     """Sys fork.

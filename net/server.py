@@ -1,22 +1,16 @@
 """
 PyOS NOVA — Network Stack
 ===========================
-Built-in HTTP server, REST API for SOS, SOS sync, mDNS discovery.
-
-Commands:
-  serve [port]          — start HTTP file server on port (default 8080)
-  api [port]            — start REST API server for SOS
-  sync <user@host>      — sync SOS objects to/from another NOVA
-  discover              — find other NOVA instances on LAN via mDNS
+REST API is DataPlane-gated (loopback by default). File server is loopback
+and disabled under lockdown. SSH is paramiko-only.
 
 REST API endpoints:
-  GET  /objects/:oid          — get object by OID
-  GET  /aliases/:path         — resolve path to object
-  POST /objects               — store new object (JSON body)
-  GET  /search?q=query        — search objects
-  GET  /tags/:tag             — find objects by tag
-  GET  /health                — health check
-  GET  /stats                 — SOS statistics
+  GET  /health                 — public
+  GET  /objects/:oid           — capability-gated get
+  GET  /aliases/:handle        — capability-gated get
+  POST /write                 — capability-gated put (handle required)
+  GET  /search?q=query        — capability-gated find
+  GET  /tags/:tag             — capability-gated find
 """
 
 import os, sys, json, threading, socket, time
@@ -32,27 +26,31 @@ if TYPE_CHECKING:
     from kernel.nova import NovaKernel
 
 
+MAX_API_BODY = 1_048_576
+API_TIMEOUT_S = 15
+
+
+class _NovaHTTPServer(HTTPServer):
+    """HTTPServer that holds a DataPlane for request-scoped sessions."""
+
+    def __init__(self, addr, handler, dataplane, sos):
+        super().__init__(addr, handler)
+        self.dataplane = dataplane
+        self.sos = sos
+
+
 # ─────────────────────────────────────────────────── REST API
 class SOSAPIHandler(BaseHTTPRequestHandler):
-    """REST API handler for the Semantic Object Store."""
+    """REST API handler. CRUD goes through DataPlane, never raw SOS."""
 
-    sos: "SemanticObjectStore" = None   # set by server before serving
+    timeout = API_TIMEOUT_S
 
     def log_message(self, fmt, *args):
-        """Log message to the activity log.
-
-            Args:
-            fmt: Fmt.
-            """
-        pass   # suppress default logging
+        """Suppress default stderr access logs."""
+        pass
 
     def _send_json(self, data, status=200):
-        """Send json.
-
-            Args:
-            data: Data.
-            status: Status, defaults to 200.
-            """
+        """Send a JSON response."""
         body = json.dumps(data, default=str).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -62,164 +60,166 @@ class SOSAPIHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_error(self, msg, status=404):
-        """Send error.
-
-            Args:
-            msg: Msg.
-            status: Status, defaults to 404.
-            """
+        """Send a JSON error payload."""
         self._send_json({"error": msg}, status)
 
+    def _token(self) -> Optional[str]:
+        auth = self.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            return auth.split(None, 1)[1].strip()
+        header = self.headers.get("X-Nova-Token")
+        return header.strip() if header else None
+
+    def _plane(self):
+        from store.dataplane import DataPlaneError
+        plane = getattr(self.server, "dataplane", None)
+        if plane is None:
+            raise DataPlaneError("dataplane unavailable; denying")
+        token = self._token()
+        if plane.enforce and not token:
+            raise DataPlaneError("capability required")
+        return plane.session(token, actor="http")
+
     def do_OPTIONS(self):
-        """Do o p t i o n s."""
+        """CORS preflight."""
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header(
+            "Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"
+        )
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Content-Type, Authorization, X-Nova-Token",
+        )
         self.end_headers()
 
     def do_GET(self):
-        """Do g e t."""
+        """Authorize then read via DataPlane."""
+        from store.dataplane import DataPlaneError
         parsed = urlparse(self.path)
-        path   = parsed.path.rstrip("/")
+        path = parsed.path.rstrip("/")
         params = parse_qs(parsed.query)
-        sos    = self.__class__.sos
-
         try:
             if path == "/health":
                 self._send_json({"status": "ok", "version": "1.0.0"})
-
-            elif path == "/stats":
-                conn  = sos._pool.get()
-                row   = conn.execute(
-                    "SELECT (SELECT COUNT(*) FROM objects) n_obj,"
-                    "(SELECT COUNT(*) FROM aliases) n_alias,"
-                    "(SELECT COALESCE(SUM(size),0) FROM objects) total_bytes,"
-                    "(SELECT COUNT(DISTINCT tag) FROM tag_index) n_tags"
-                ).fetchone()
-                self._send_json({
-                    "objects": row["n_obj"], "aliases": row["n_alias"],
-                    "total_kb": row["total_bytes"]//1024, "tags": row["n_tags"],
-                })
-
+                return
+            plane = self._plane()
+            if path == "/stats":
+                rows = plane.find(limit=1)
+                self._send_json({"authorized": True, "sample": len(rows)})
             elif path.startswith("/objects/"):
-                oid = unquote(path[9:])
-                obj = sos.get(oid)
-                if not obj:
-                    self._send_error("Object not found")
-                    return
+                rec = plane.get(unquote(path[9:]))
                 self._send_json({
-                    "oid": obj.oid, "kind": obj.kind, "size": obj.size,
-                    "version": obj.version, "tags": obj.tags,
-                    "meta": obj.meta, "created_at": obj.created_at,
-                    "content": obj.text[:4096],  # truncate large objects
+                    "oid": rec.oid, "handle": rec.handle, "kind": rec.kind,
+                    "size": rec.size, "version": rec.version, "tags": rec.tags,
+                    "content": rec.content[:4096],
                 })
-
             elif path.startswith("/aliases/"):
-                p   = "/" + unquote(path[9:])
-                oid = sos.resolve(p)
-                if not oid:
-                    self._send_error("Path not found")
-                    return
-                obj = sos.get(oid)
-                self._send_json({"path": p, "oid": oid,
-                                  "kind": obj.kind if obj else "?",
-                                  "size": obj.size if obj else 0})
-
+                handle = unquote(path[9:]).lstrip("/")
+                rec = plane.get(handle)
+                self._send_json({
+                    "handle": rec.handle, "oid": rec.oid,
+                    "kind": rec.kind, "size": rec.size,
+                })
             elif path == "/search":
-                q       = params.get("q", [""])[0]
-                results = sos.keyword_search(q, n=20)
+                q = params.get("q", [""])[0]
+                limit = int(params.get("limit", ["20"])[0])
+                results = plane.find(query=q, limit=min(max(limit, 1), 200))
                 self._send_json({"query": q, "results": results})
-
             elif path.startswith("/tags/"):
-                tag   = unquote(path[6:])
-                paths = sos.find_by_tag(tag)
-                self._send_json({"tag": tag, "count": len(paths), "paths": paths})
-
+                tag = unquote(path[6:])
+                results = plane.find(tag=tag)
+                self._send_json({
+                    "tag": tag, "count": len(results), "results": results,
+                })
             elif path == "/ls" or path.startswith("/ls/"):
-                dir_path = unquote(path[3:]) or "/"
-                children = sos.listdir(dir_path)
-                items    = []
-                for name in children:
-                    fp  = dir_path.rstrip("/") + "/" + name
-                    oid = sos.resolve(fp)
-                    obj = sos.get(oid) if oid else None
-                    items.append({"name": name, "path": fp,
-                                   "kind": obj.kind if obj else "?",
-                                   "size": obj.size if obj else 0})
-                self._send_json({"path": dir_path, "items": items})
-
+                results = plane.find()
+                self._send_json({"items": results})
             else:
                 self._send_error("Not found", 404)
-
-        except Exception as e:
-            self._send_error(str(e), 500)
+        except DataPlaneError as exc:
+            self._send_error(str(exc), 403)
+        except Exception as exc:
+            self._send_error(str(exc), 500)
 
     def do_POST(self):
-        """Do p o s t."""
+        """Authorize then mutate via DataPlane."""
+        from store.dataplane import DataPlaneError
         parsed = urlparse(self.path)
-        path   = parsed.path.rstrip("/")
-        sos    = self.__class__.sos
-
-        content_len = int(self.headers.get("Content-Length", 0))
-        body_bytes  = self.rfile.read(content_len) if content_len else b"{}"
-
+        path = parsed.path.rstrip("/")
+        try:
+            content_len = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError:
+            self._send_error("invalid Content-Length", 400)
+            return
+        if content_len > MAX_API_BODY:
+            remaining = content_len
+            while remaining:
+                chunk = self.rfile.read(min(65536, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+            self._send_error("payload too large", 413)
+            return
+        body_bytes = self.rfile.read(content_len) if content_len else b"{}"
         try:
             data = json.loads(body_bytes)
         except Exception:
             self._send_error("Invalid JSON body", 400)
             return
-
         try:
+            plane = self._plane()
             if path == "/objects":
-                content = data.get("content", "")
-                kind    = data.get("kind", "text")
-                meta    = data.get("meta", {})
-                tags    = data.get("tags", [])
-                oid     = sos.store(content, kind=kind, meta=meta, tags=tags)
-                self._send_json({"oid": oid}, 201)
-
+                self._send_error(
+                    "anonymous blob store disabled; POST /write with handle",
+                    400,
+                )
             elif path == "/write":
-                fpath   = data.get("path", "")
+                handle = data.get("handle") or data.get("path", "")
                 content = data.get("content", "")
-                kind    = data.get("kind", "text")
-                tags    = data.get("tags", [])
-                if not fpath:
-                    self._send_error("path required", 400)
+                kind = data.get("kind", "text")
+                tags = data.get("tags", [])
+                if not handle:
+                    self._send_error("handle required", 400)
                     return
-                oid = sos.write(fpath, content, kind=kind, tags=tags)
-                self._send_json({"path": fpath, "oid": oid}, 201)
-
+                rec = plane.put(handle, content, kind=kind, tags=tags)
+                self._send_json(
+                    {"handle": rec.handle, "oid": rec.oid}, 201
+                )
             else:
                 self._send_error("Not found", 404)
-        except Exception as e:
-            self._send_error(str(e), 500)
+        except DataPlaneError as exc:
+            self._send_error(str(exc), 403)
+        except Exception as exc:
+            self._send_error(str(exc), 500)
 
 
 class APIServer:
     """NOVA REST API server."""
 
-    def __init__(self, sos: "SemanticObjectStore", port: int = 8080):
-        """Initialise the instance."""
-        self.sos     = sos
-        self.port    = port
+    def __init__(self, sos: "SemanticObjectStore", port: int = 8080,
+                 host: str = "127.0.0.1", dataplane=None):
+        """Bind loopback by default. ``dataplane`` is required for CRUD."""
+        self.sos = sos
+        self.port = port
+        self.host = host
+        self.dataplane = dataplane
         self._server: Optional[HTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
     def start(self) -> str:
-        """Start the operation.
-
-
-            Returns:
-                str: Result.
-            """
-        SOSAPIHandler.sos = self.sos
-        self._server = HTTPServer(("0.0.0.0", self.port), SOSAPIHandler)
-        self._thread = threading.Thread(target=self._server.serve_forever,
-                                         daemon=True, name="nova-api")
+        """Start the REST API on the configured host (loopback by default)."""
+        if self.host in {"0.0.0.0", "::"}:
+            self.host = "127.0.0.1"
+        self._server = _NovaHTTPServer(
+            (self.host, self.port), SOSAPIHandler, self.dataplane, self.sos
+        )
+        self.port = self._server.server_address[1]
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, daemon=True, name="nova-api"
+        )
         self._thread.start()
-        ip = self._get_local_ip()
-        return f"http://{ip}:{self.port}"
+        return f"http://{self.host}:{self.port}"
 
     def stop(self):
         """Stop the operation."""
@@ -305,29 +305,30 @@ class FileServerHandler(BaseHTTPRequestHandler):
 
 
 class FileServer:
-    """File server."""
-    def __init__(self, sos, port: int = 8080):
+    """Loopback file server. Disabled when DataPlane lockdown is on."""
+
+    def __init__(self, sos, port: int = 8081, host: str = "127.0.0.1"):
         """Initialise the instance."""
-        self.sos = sos; self.port = port
-        self._server = None; self._thread = None
+        self.sos = sos
+        self.port = port
+        self.host = host
+        self.dataplane = None
+        self._server = None
+        self._thread = None
 
     def start(self) -> str:
-        """Start the operation.
-
-
-            Returns:
-                str: Result.
-            """
+        """Start on loopback. Refuse if lockdown is enabled."""
+        plane = getattr(self, "dataplane", None)
+        if plane is not None and getattr(plane, "enforce", False):
+            raise RuntimeError("file server disabled under capability lockdown")
+        if self.host in {"0.0.0.0", "::"}:
+            self.host = "127.0.0.1"
         FileServerHandler.sos = self.sos
-        self._server = HTTPServer(("0.0.0.0", self.port), FileServerHandler)
+        self._server = HTTPServer((self.host, self.port), FileServerHandler)
         self._thread = threading.Thread(target=self._server.serve_forever,
                                          daemon=True, name="nova-serve")
         self._thread.start()
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8",80)); ip = s.getsockname()[0]; s.close()
-        except: ip = "127.0.0.1"
-        return f"http://{ip}:{self.port}"
+        return f"http://{self.host}:{self.port}"
 
     def stop(self):
         """Stop the operation."""

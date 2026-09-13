@@ -404,14 +404,11 @@ class RaftState(Enum):
 
 
 class RaftNode:
-    """
-    Simplified Raft consensus node for NOVA cluster HA.
+    """Raft leader-election helper. Not a replicated log.
 
-    Implements leader election and heartbeat only (no log replication —
-    the CRDT SOS handles data consistency separately).
-
-    Two nodes can form a quorum for availability; three for full split-brain
-    protection.
+    DataPy.os does not claim committed replicated SOS data from this
+    module. Election and heartbeat state is not a durable consensus
+    contract. Unsupported log operations fail explicitly.
     """
 
     HEARTBEAT_MS   = 150
@@ -440,6 +437,20 @@ class RaftNode:
         self._lock      = threading.Lock()
         self._running   = False
         self._load_state()
+
+    @staticmethod
+    def majority(total_nodes: int) -> int:
+        """Return floor(N/2)+1 votes required, including even cluster sizes."""
+        if total_nodes < 1:
+            return 1
+        return total_nodes // 2 + 1
+
+    def append_entries(self, *args, **kwargs) -> None:
+        """Replicated-log API is not implemented on the supported single-node path."""
+        raise NotImplementedError(
+            "Raft log replication is experimental and not part of the "
+            "supported single-node DataPy.os release"
+        )
 
     def _load_state(self):
         """Load persisted Raft state from SOS."""
@@ -498,7 +509,7 @@ class RaftNode:
         self._save_state()
 
         import urllib.request
-        quorum = (len(self.peers) + 2) // 2   # majority
+        quorum = self.majority(len(self.peers) + 1)
 
         for peer_url in self.peers:
             try:
@@ -627,40 +638,55 @@ class ComplianceManager:
         Returns:
             dict with count of erased objects.
         """
-        erased = 0
+        erased_ok = 0
+        retained = []
+        errors = []
         try:
-            # Find objects belonging to this user
-            tagged = self._sos.find_by_tag(username)
-            for obj_id in tagged:
-                try:
-                    # Get all aliases for this OID
-                    conn  = self._sos._pool.get()
-                    paths = [r[0] for r in
-                              conn.execute("SELECT path FROM aliases WHERE oid=?",
-                                            (obj_id,)).fetchall()]
-                    for path in paths:
-                        self._sos.remove(path)
-                    erased += 1
-                except Exception:
-                    pass
-        except Exception:
-            pass
+            tagged = self._sos.find_by_tag(username, fuzzy=False)
+            for item in tagged:
+                path = item
+                if len(item) == 32 and all(c in "0123456789abcdef" for c in item):
+                    # Legacy OID; resolve aliases first.
+                    conn = self._sos._pool.get()
+                    paths = [r[0] for r in conn.execute(
+                        "SELECT path FROM aliases WHERE oid=?", (item,)
+                    ).fetchall()]
+                else:
+                    paths = [path]
+                for pth in paths:
+                    try:
+                        if self._sos.exists(pth):
+                            self._sos.remove(pth)
+                            if not self._sos.exists(pth):
+                                erased_ok += 1
+                            else:
+                                retained.append(pth)
+                    except Exception as exc:
+                        errors.append(f"{pth}: {exc}")
+        except Exception as exc:
+            errors.append(str(exc))
 
-        # Record erasure in audit log
+        record = {
+            "user": username,
+            "erased": erased_ok,
+            "erased_objects": erased_ok,
+            "retained": retained,
+            "errors": errors,
+            "ts": time.time(),
+            "soft_delete": True,
+            "complete_erasure": False,
+            "note": "shared blobs and revision history are retained",
+        }
         try:
             self._sos.write(
                 f"/compliance/erasures/{username}_{int(time.time())}",
-                json.dumps({
-                    "user":    username,
-                    "erased":  erased,
-                    "ts":      time.time(),
-                    "gdpr":    "Article 17 erasure",
-                }),
+                json.dumps(record),
                 tags=["gdpr-erasure"],
             )
-        except Exception:
-            pass
-        return {"erased_objects": erased, "user": username}
+        except Exception as exc:
+            errors.append(f"audit write failed: {exc}")
+            record["errors"] = errors
+        return record
 
     def scan_phi(self, content: str) -> List[str]:
         """

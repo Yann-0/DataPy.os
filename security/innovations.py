@@ -282,7 +282,7 @@ class NetworkIDS:
         """Initialise the network IDS."""
         self.sos         = sos
         self.audit       = audit
-        self._lock       = threading.Lock()
+        self._lock       = threading.RLock()
         self._ip_hits:   Dict[str, List[float]] = {}
         self._blocked:   set = set()
         self._alerts:    List[dict] = []

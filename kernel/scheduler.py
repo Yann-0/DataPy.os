@@ -77,6 +77,11 @@ class NovaTask:
             self._task.cancel()
             self.status = "cancelled"
             return True
+        future = getattr(self, "_future", None)
+        if future is not None and not future.done():
+            future.cancel()
+            self.status = "cancelled"
+            return True
         return False
 
     def to_dict(self) -> dict:
