@@ -32,7 +32,7 @@ ssh      = ["paramiko"]
 compress = ["zstandard", "lz4"]
 i18n     = ["argostranslate"]
 rpi      = ["gpiod", "smbus2"]
-dev      = ["pytest", "pytest-asyncio", "pytest-cov", "ruff", "psutil", "numpy"]
+dev      = ["pytest", "pytest-asyncio", "pytest-cov", "pytest-timeout", "ruff", "psutil", "numpy"]
 full     = ["datapy-os[ai,search,ssh,compress,i18n]"]
 
 [tool.ruff]

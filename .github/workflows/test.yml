@@ -58,6 +58,7 @@ jobs:
   test:
     name: Tests (Python ${{ matrix.python-version }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     needs: syntax
     strategy:
       fail-fast: false
@@ -82,6 +83,7 @@ jobs:
       - name: Run test suite
         run: |
           pytest tests/ -v --tb=short \
+            --timeout=30 \
             --ignore=tests/bench.py \
             --cov=. --cov-report=term-missing \
             --cov-report=xml:coverage.xml \
