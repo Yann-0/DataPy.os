@@ -2,20 +2,24 @@
 
 ## Overview
 
-PyOS NOVA is a research operating system where Python replaces `/sbin/init`.
-On a real machine, `boot/pyinit.py` is the first userspace process (PID 1).
-On a developer workstation, `python3 main.py` starts the full kernel in-process.
+DataPy.os is a data-native operating system: **data + Python + AI**.
+On a Raspberry Pi 5 the supported userspace is Linux + Python PID-1
+(`boot/pyinit.py`). On a developer workstation, `python3 main.py` starts
+the same kernel in-process.
+
+Firmware-native UEFI (Python as an EFI application, no Linux kernel) is
+an **experimental** research path. It is not a supported runtime until it
+passes its own real-execution acceptance.
 
 ```
-Hardware / UEFI
+Supported: Raspberry Pi 5 Linux kernel + Python userspace / PID-1
+            or host CPython 3.11+
       ↓
-boot/efi_builder.py    PE32+ EFI binary (x86-64 / ARM64 / RISC-V)
-      ↓
-boot/pyinit.py         PID 1 — mounts filesystems, starts kernel
-      ↓
+boot/pyinit.py         PID 1 on Linux — mounts, starts kernel
 kernel/nova.py         NovaKernel — owns all subsystems
-      ↓
-shell/nova_shell.py    Interactive shell (120+ commands)
+store/dataplane.py     Authorized CRUD (primary surface)
+store/sos.py           Content-addressed SQLite WAL
+shell/nova_shell.py    Interactive shell
 ```
 
 ---
@@ -94,30 +98,31 @@ secrets. The Merkle-chained ledger provides tamper-evident audit trails.
 ### Networking
 
 ```
-/net/server.py         REST API + SOS file server (HTTP)
-/net/ssh_server.py     SSH server (paramiko + TCP fallback)
+/net/server.py         REST API via DataPlane (loopback default)
+/net/ssh_server.py     SSH server (paramiko required; no TCP fallback)
 /net/discovery.py      mDNS service discovery, API gateway, DNS
-/net/crdt.py           CRDT-based distributed SOS sync
+/net/crdt.py           CRDT-based distributed SOS sync (not a Raft log)
 /net/innovations.py    P2P mesh (content-addressed), WebSocket, TOFU, 2PC
 /net/http_client.py    HTTP client, health server, distributed replicator
 ```
 
 ---
 
-## Boot Sequence
+## Boot Sequence (Linux / Pi 5 — supported design)
 
 ```
-1. UEFI firmware loads boot/BOOTX64.EFI (PE32+ Python stub)
-2. EFI stub launches python3 boot/pyinit.py as PID 1
-3. pyinit mounts the SOS database at /nova/data/
-4. pyinit checks SOS integrity (WAL recovery if corrupt)
-5. pyinit imports kernel/nova.py and calls NovaKernel.boot()
-6. NovaKernel initialises subsystems in dependency order:
-     SOS → EventBus → WAQ → AI → Scheduler → Watchdog → i18n → ...
-7. NovaKernel starts the shell, REST API, SSH, metrics server
-8. Control returns to pyinit which enters a wait loop
-   (restarting the kernel on crash with exponential back-off)
+1. Raspberry Pi firmware loads the Linux kernel + initramfs from FAT boot
+2. PID 1 is Python (boot/pyinit.py) inside the initramfs
+3. pyinit mounts proc/sys/dev, then the labelled NOVA_DATA ext4 partition
+4. pyinit starts NovaKernel
+5. NovaKernel initialises SOS → DataPlane → shell / optional REST
+6. Persistence is the labelled NOVA_DATA filesystem, not an unformatted 0x83 slice
 ```
+
+Firmware-native UEFI boot (PE stub → python3.efi) is experimental and is not
+this sequence. A host ELF converted to PE is not a native runtime.
+
+Host development skips firmware and runs `python main.py` against `NOVA_DATA`.
 
 ---
 

@@ -46,31 +46,22 @@ cannot be attributed to a specific commit from the screenshot alone.
 
 ## Remaining image blockers
 
-This fix removes the reported bootstrap dependency. It does not certify the
-current image builder as producing a fully working OS:
+PR #1 plus this continuation implement host regressions for streams, CPIO
+nodes, FAT allocation, labelled ext4 in a new image file, musl Python prefix
+normalization, and current-checkout source packaging. They do **not** certify
+a Pi 5 boot.
 
-1. The Pi Python builder does not bundle `mount`, `blkid`, `reboot`, or `halt`.
-   Inherit/checking streams can reveal `FileNotFoundError: mount` next. Bundle
-   target-compatible utilities and their dependencies, or deliberately adopt
-   and test a Linux-specific bootstrap backend.
-2. The configured GNU/Linux Python distribution is described as static, but
-   its runtime dependency closure and extracted directory layout are not
-   validated or reliably copied. Validate the ELF interpreter, libraries,
-   extension modules and standard-library paths in the actual archive.
-3. The Pi image's second partition is reserved and marked type `0x83` but is
-   not formatted or labelled. Creating a partition entry is not creating a
-   persistent filesystem. Never format an existing user's partition as an
-   implicit boot-time repair.
-4. The fallback FAT writer reuses cluster 3 for every file, does not allocate
-   multi-cluster chains, and truncates required long names. Require a real
-   FAT implementation and fail image creation if file readback fails.
-5. The source ZIP input is not produced automatically from the current
-   checkout. Add a source manifest to prevent stale code entering an image.
+Still required before marking the Pi target working:
 
-Acceptance must include an actual target boot, verified required mounts,
-interactive input, a DataPlane write, clean shutdown, restart, and readback of
-the same data from the identified persistent partition. A successful archive
-build or eight passing host tests does not establish those outcomes.
+1. Target-compatible `mount`/`blkid`/loader closure on a real ARM64 boot.
+2. Verified kernel modules/firmware for storage, console, and network.
+3. Actual emulator or authorised hardware boot, interactive shell, write,
+   clean shutdown, restart, and readback from the labelled `NOVA_DATA`
+   partition.
+4. Do not flash without an explicit device. Do not guess `/dev/sdX`.
+
+A successful archive build or passing host tests does not establish those
+outcomes.
 
 ## Installation and CI repairs included
 

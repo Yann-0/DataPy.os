@@ -27,14 +27,11 @@ jobs:
 
       - name: Gate — syntax + tests must pass
         run: |
-          python3 -m compileall . -q
-          pytest tests/ --ignore=tests/bench.py -q \
-            --tb=short -x \
-            -e "NOVA_NO_AI=1" \
-            -e "NOVA_DATA=/tmp/nova_release_test"
+          python -m compileall -q -x "(\.venv|site-packages)" .
+          pytest tests/ --ignore=tests/bench.py -q --tb=short --timeout=30
         env:
           NOVA_NO_AI: "1"
-          NOVA_DATA:  /tmp/nova_release_test
+          NOVA_DATA: /tmp/nova_release_test
 
       - name: Extract version from tag
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_ENV
