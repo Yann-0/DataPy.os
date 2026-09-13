@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "datapy-os"
 version = "0.0008"
@@ -8,6 +12,18 @@ license = {text = "MIT"}
 
 [project.scripts]
 datapy = "main:main"
+
+[tool.setuptools]
+py-modules = ["main"]
+# Explicit discovery avoids flat-layout rejection and excludes tests/build outputs.
+packages = [
+    "ai", "apps", "boot", "build", "i18n", "kernel", "net", "plugins",
+    "rpi", "runtime", "search", "security", "shell", "store", "system", "tags",
+]
+
+[tool.setuptools.package-data]
+boot = ["*.c"]
+build = ["*.sh"]
 
 [project.optional-dependencies]
 ai       = ["llama-cpp-python", "numpy"]
