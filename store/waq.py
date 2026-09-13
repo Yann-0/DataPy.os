@@ -280,6 +280,6 @@ def patch_sos_with_waq(sos: "SemanticObjectStore") -> WriteAheadQueue:
         sos._obj_cache.set(oid, obj)
         return oid
 
-    sos.store = _batched_store
+    waq        = WriteAheadQueue(sos)
     sos._waq  = waq
     return waq
