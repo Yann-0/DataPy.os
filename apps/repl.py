@@ -22,12 +22,16 @@ from __future__ import annotations
 import os
 import sys
 import time
-import code
-import readline
-import rlcompleter
 import traceback
 import textwrap
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+try:
+    import readline
+    import rlcompleter
+except ImportError:
+    readline = None
+    rlcompleter = None
 
 if TYPE_CHECKING:
     from kernel.nova import NovaKernel
@@ -269,6 +273,8 @@ class RichREPL:
 
     def _setup_readline(self):
         """Configure readline with tab-completion and history."""
+        if readline is None or rlcompleter is None:
+            return
         readline.set_completer(rlcompleter.Completer(self._ns).complete)
         readline.parse_and_bind("tab: complete")
         readline.set_history_length(HISTORY_SIZE)
@@ -279,7 +285,8 @@ class RichREPL:
             raw = self.kernel.sos.read(HISTORY_SOS_PATH)
             self.history = [l for l in raw.splitlines() if l.strip()]
             for cmd in self.history[-50:]:
-                readline.add_history(cmd)
+                if readline is not None:
+                    readline.add_history(cmd)
         except Exception:
             pass
 

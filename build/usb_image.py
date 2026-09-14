@@ -152,7 +152,9 @@ def _mount(fs, path, fstype="tmpfs", opts=""):
     if opts:
         args += ["-o", opts]
     args += [fs, path]
-    subprocess.run(args, stderr=subprocess.DEVNULL)
+    # Inherit the console before devtmpfs makes /dev/null available.
+    # A failed essential mount must not be reported as a successful boot step.
+    subprocess.run(args, check=True)
 
 def _log(msg, level="INFO"):
     ts = time.strftime("%H:%M:%S")
@@ -294,7 +296,7 @@ class CPIOWriter:
 
     def __init__(self):
         """Initialise the CPIO writer."""
-        self._entries: List[Tuple[str, bytes, int]] = []   # (path, data, mode)
+        self._entries: List[Tuple[str, bytes, int, int, int]] = []
         self._ino = 1
 
     def add_file(self, path: str, data: bytes,
@@ -307,19 +309,25 @@ class CPIOWriter:
             data: File contents.
             mode: Unix file mode bits.
         """
-        self._entries.append((path.lstrip("/"), data, mode))
+        self._entries.append((path.lstrip("/"), data, mode, 0, 0))
 
     def add_dir(self, path: str, mode: int = 0o040755):
         """Add a directory entry."""
-        self._entries.append((path.lstrip("/"), b"", mode | 0o040000))
+        self._entries.append((path.lstrip("/"), b"", mode | 0o040000, 0, 0))
 
     def add_symlink(self, path: str, target: str):
         """Add a symbolic link."""
         self._entries.append(
-            (path.lstrip("/"), target.encode(), 0o120777)
+            (path.lstrip("/"), target.encode(), 0o120777, 0, 0)
         )
 
-    def _header(self, name: str, data: bytes, mode: int) -> bytes:
+    def add_device(self, path: str, major: int, minor: int,
+                   permissions: int = 0o600) -> None:
+        """Encode a character device without requiring host mknod privileges."""
+        self._entries.append((path.lstrip("/"), b"", 0o020000 | permissions, major, minor))
+
+    def _header(self, name: str, data: bytes, mode: int,
+                rdevmajor: int = 0, rdevminor: int = 0) -> bytes:
         """
         Build a newc CPIO header for one entry.
 
@@ -345,8 +353,8 @@ class CPIOWriter:
             + hex8(data_len)             # filesize
             + hex8(0)                    # devmajor
             + hex8(0)                    # devminor
-            + hex8(0)                    # rdevmajor
-            + hex8(0)                    # rdevminor
+            + hex8(rdevmajor)            # device major number
+            + hex8(rdevminor)            # device minor number
             + hex8(name_len)             # namesize
             + hex8(0)                    # check
         )  # 110 bytes
@@ -365,8 +373,8 @@ class CPIOWriter:
     def build(self) -> bytes:
         """Build and return the complete CPIO archive bytes."""
         parts = []
-        for path, data, mode in self._entries:
-            parts.append(self._header(path, data, mode))
+        for entry in self._entries:
+            parts.append(self._header(*entry))
         parts.append(self._trailer())
         return b"".join(parts)
 
@@ -551,7 +559,8 @@ exec(open("/nova/boot/pyinit_usb.py").read())
         self.cpio.add_file("etc/fstab",
             b"# PyOS NOVA fstab\ntmpfs /tmp tmpfs defaults 0 0\n")
         # /dev/console pre-created so the kernel can open it
-        self.cpio.add_file("dev/console",    b"", mode=0o20600)
+        self.cpio.add_device("dev/console", 5, 1, permissions=0o600)
+        self.cpio.add_device("dev/null", 1, 3, permissions=0o666)
 
 
 # ─────────────────────────────────────────────────────────── GPT disk image

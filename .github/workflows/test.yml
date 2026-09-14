@@ -35,7 +35,7 @@ jobs:
 
       - name: Compile all Python files
         run: |
-          python3 -m compileall . -q 2>&1 | head -20
+          python -m compileall -q -x "(\.venv|site-packages|downloads)" .
           echo "Syntax check complete"
 
   # ── Job 2: Lint with ruff ────────────────────────────────────────────────────
@@ -58,6 +58,7 @@ jobs:
   test:
     name: Tests (Python ${{ matrix.python-version }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     needs: syntax
     strategy:
       fail-fast: false
@@ -82,6 +83,7 @@ jobs:
       - name: Run test suite
         run: |
           pytest tests/ -v --tb=short \
+            --timeout=30 \
             --ignore=tests/bench.py \
             --cov=. --cov-report=term-missing \
             --cov-report=xml:coverage.xml \

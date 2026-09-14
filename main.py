@@ -239,7 +239,8 @@ def main() -> int:
     kernel = NovaKernel()
 
     try:
-        kernel.boot()
+        if not args.cmd:
+            kernel.boot()
     except Exception as exc:           # pragma: no cover
         log.exception("Kernel boot failed: %s", exc)
         return 1
@@ -249,18 +250,34 @@ def main() -> int:
         if args.cmd:
             # Non-interactive: run one command and exit.
             from shell.nova_shell import NovaShell
-            shell  = NovaShell(kernel)
-            result = shell.run_command(args.cmd)
-            return 0 if result is None else int(bool(result))
+            shell = NovaShell(kernel)
+            result = shell.execute(args.cmd)
+            if not result.ok:
+                log.error("command failed: %s", result.error or args.cmd)
+            return 0 if result.ok else 1
 
         elif args.daemon:
-            # Headless daemon: keep running until SIGTERM.
-            log.info("Daemon mode — REST API on :8080, SSH on :2222")
+            log.info("Daemon mode — REST API on 127.0.0.1 (SSH only if requested)")
+            host = os.environ.get("NOVA_API_HOST", "127.0.0.1")
+            port = int(os.environ.get("NOVA_API_PORT", "0"))
+            if port == 0:
+                import socket as _sock
+                s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+                s.bind((host, 0))
+                port = s.getsockname()[1]
+                s.close()
+            kernel.api_server.host = host
+            kernel.api_server.port = port
+            url = kernel.api_server.start()
+            ready = Path(data_dir) / "daemon.ready"
+            ready.write_text(url, encoding="utf-8")
+            log.info("daemon ready %s", url)
             import signal
             stop_event = __import__("threading").Event()
             signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
             signal.signal(signal.SIGINT,  lambda *_: stop_event.set())
             stop_event.wait()
+            kernel.api_server.stop()
             return 0
 
         else:

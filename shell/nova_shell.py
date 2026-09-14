@@ -3,8 +3,13 @@ PyOS NOVA Shell
 All commands, including SOS-aware operations.
 """
 
-import os, re, sys, time, shlex, readline, subprocess
+import os, re, sys, time, shlex, subprocess
 from typing import TYPE_CHECKING
+
+try:
+    import readline
+except ImportError:
+    readline = None
 
 if TYPE_CHECKING:
     from kernel.nova import NovaKernel
@@ -15,6 +20,16 @@ C = {
     "blue": "\033[34m", "purple": "\033[35m", "cyan": "\033[36m", "white": "\033[37m",
 }
 col = lambda t, c: f"{C.get(c,'')}{t}{C['reset']}"
+
+
+class CommandResult:
+    """Result of a non-interactive shell command."""
+
+    def __init__(self, ok: bool, command: str, error: str = "") -> None:
+        self.ok = ok
+        self.command = command
+        self.error = error
+        self.exit_code = 0 if ok else 1
 
 
 class NovaShell:
@@ -37,7 +52,9 @@ class NovaShell:
          pid=5, user="root", cmd="[nova-shell]", state="R")
 
     def _setup_readline(self):
-        """Set up readline."""
+        """Set up readline when the host provides it."""
+        if readline is None:
+            return
         readline.parse_and_bind("tab: complete")
         readline.set_completer(self._complete)
         readline.set_completer_delims(" \t\n;|")
@@ -50,6 +67,8 @@ class NovaShell:
             state: State.
             """
         opts = []
+        if readline is None:
+            return None
         line = readline.get_line_buffer().split()
         if not line or (len(line)==1 and not readline.get_line_buffer().endswith(" ")):
             opts = [c for c in self._cmds_cache if c.startswith(text)]
@@ -73,36 +92,51 @@ class NovaShell:
         return self.sos.resolve_path(path, self.cwd)
 
     def _prompt(self):
-        """Prompt."""
-        disp = self.cwd.replace(self.env.get("HOME",""), "~")
-        pend = self.kernel.advisor.pending()
+        """Prompt centred on handles, not classical paths."""
+        disp = "@" if self.cwd in {"@", "/", ""} else self.cwd.replace(
+            self.env.get("HOME", ""), "~"
+        )
+        pend = 0
+        try:
+            pend = self.kernel.advisor.pending()
+        except Exception:
+            pend = 0
         badge = col(f" [{pend}!]", "yellow") if pend else ""
-        uc = "red" if self.user=="root" else "green"
-        return f"{col(self.user,uc)}{col('@','dim')}{col('nova','cyan')}{col(':','dim')}{col(disp,'blue')}{badge}{col('$ ','white')}"
+        uc = "red" if self.user == "root" else "green"
+        return (
+            f"{col(self.user, uc)}{col('@', 'dim')}{col('datapy', 'cyan')}"
+            f"{col(':', 'dim')}{col(disp, 'blue')}{badge}{col('$ ', 'white')}"
+        )
 
-    """Err.
-
-        Args:
-        m: M.
-        """
     def _err(self, m): print(col(f"  {m}", "red"), file=sys.stderr)
-    """Ok.
 
-        Args:
-        m: M.
-        """
     def _ok(self,  m): print(col(f"  {m}", "green"))
 
     # ─── run loop ─────────────────────────────────────────────────────────────
     def run(self):
-        """Run the operation."""
-        try:
-            motd = self.sos.read("/etc/motd")
-            print(motd)
-        except: pass
+        """Interactive loop — data OS banner first."""
+        shown = False
+        for path in ("/system/motd", "/etc/motd"):
+            try:
+                print(self.sos.read(path))
+                shown = True
+                break
+            except Exception:
+                continue
+        if not shown:
+            try:
+                welcome = self.kernel.data.get("welcome")
+                print(welcome.content)
+            except Exception:
+                print(col("  DataPy.os — data is the filesystem.", "cyan"))
+                print(col("  Try: data put note 'hello'  |  data find  |  data lock on", "dim"))
 
         print(col(f"  AI: {self.kernel.ai.model_name}", "dim"))
-        print(col(f"  SOS: {len(self.sos.listdir('/'))} top-level objects", "dim"))
+        try:
+            n = len(self.kernel.data.find(limit=5))
+            print(col(f"  DataPlane: ready ({n}+ handles visible)", "dim"))
+        except Exception:
+            print(col("  DataPlane: ready", "dim"))
         print()
 
         while not self._exit:
@@ -116,6 +150,17 @@ class NovaShell:
             self._exec_line(line)
 
         return "reboot" if self._reboot else "halt"
+
+    def execute(self, line: str) -> CommandResult:
+        """Run one command and return a success/failure contract."""
+        try:
+            code = self._run_cmd(line)
+            if code:
+                return CommandResult(False, line)
+            return CommandResult(True, line)
+        except Exception as exc:
+            self._err(str(exc))
+            return CommandResult(False, line, str(exc))
 
     def _exec_line(self, line):
         """Exec line.
@@ -147,21 +192,40 @@ class NovaShell:
             cmdline, redir_file = cmdline.rsplit(">>",1); redir_file=redir_file.strip(); redir_app=True
         elif ">" in cmdline:
             cmdline, redir_file = cmdline.rsplit(">",1); redir_file=redir_file.strip()
-        try: tokens = shlex.split(cmdline)
-        except: self._err(f"parse error: {cmdline}"); return
-        if not tokens: return
+        try:
+            tokens = shlex.split(cmdline)
+        except Exception:
+            self._err(f"parse error: {cmdline}")
+            return 1
+        if not tokens:
+            return 0
         cmd, args = tokens[0], tokens[1:]
         fn = self._cmds_cache.get(cmd)
-        if not fn: self._err(f"{cmd}: command not found  (type 'help')"); return
-        if redir_file:
-            import io; buf=io.StringIO(); old=sys.stdout; sys.stdout=buf
-            try: fn(args)
-            finally: sys.stdout=old
-            rp = self._resolve(redir_file)
-            content = (self.sos.read(rp) if (redir_app and self.sos.exists(rp)) else "") + buf.getvalue()
-            self.sos.write(rp, content)
-        else:
-            fn(args)
+        if not fn:
+            self._err(f"{cmd}: command not found  (type 'help')")
+            return 1
+        try:
+            if redir_file:
+                import io
+                buf = io.StringIO()
+                old = sys.stdout
+                sys.stdout = buf
+                try:
+                    fn(args)
+                finally:
+                    sys.stdout = old
+                rp = self._resolve(redir_file)
+                content = (
+                    (self.sos.read(rp) if (redir_app and self.sos.exists(rp)) else "")
+                    + buf.getvalue()
+                )
+                self.sos.write(rp, content)
+            else:
+                fn(args)
+            return 0
+        except Exception as exc:
+            self._err(str(exc))
+            return 1
 
     # ─── commands registry ────────────────────────────────────────────────────
     def _build_cmds(self):
@@ -367,64 +431,59 @@ class NovaShell:
             "syscalls": self._syscalls,
         }
 
-    # ════ FILESYSTEM ═════════════════════════════════════════════════════════
+    # ════ FILESYSTEM (legacy — prefer data *) ════════════════════════════════
     def _ls(self, args):
-        """Ls.
-
-            Args:
-            args: Args.
-            """
-        flags=""; paths=[]
+        """Legacy path listing — prefer ``data find``."""
+        if not getattr(self, "_legacy_path_warned", False):
+            print(col(
+                "  note: ls is legacy; prefer  data find  /  data find tag=…",
+                "yellow",
+            ))
+            self._legacy_path_warned = True
+        flags = ""
+        paths = []
         for a in args:
-            if a.startswith("-"): flags+=a[1:]
-            else: paths.append(a)
-        if not paths: paths=[self.cwd]
+            if a.startswith("-"):
+                flags += a[1:]
+            else:
+                paths.append(a)
+        if not paths:
+            paths = [self.cwd]
         for path in paths:
             rp = self._resolve(path)
             try:
                 if self.sos.is_file(rp):
-                    print(rp.split("/")[-1]); continue
+                    print(rp.split("/")[-1])
+                    continue
                 children = self.sos.listdir(rp)
-                if "a" not in flags: children = [c for c in children if not c.startswith(".")]
+                if "a" not in flags:
+                    children = [c for c in children if not c.startswith(".")]
                 children.sort()
-                if "l" in flags:
-                    print(f"total {len(children)}")
-                    for c in children:
-                        fp   = rp.rstrip("/")+"/"+c
-                        node = self.sos._inodes.get(fp)
-                        if not node: continue
-                        perm = "drwxr-xr-x" if node.is_dir() else "-rw-r--r--"
-                        tags = self.sos.get_tags(fp)
-                        tstr = " "+" ".join(col(f"#{t}","purple") for t in tags) if tags else ""
-                        nm   = col(c+"/","cyan") if node.is_dir() else c
-                        print(f"{perm} {self.user:8} {node.size:6} {nm}{tstr}")
-                else:
-                    row=""
-                    for c in children:
-                        fp  = rp.rstrip("/")+"/"+c
-                        nd  = self.sos._inodes.get(fp)
-                        nm  = col(c+"/","cyan") if (nd and nd.is_dir()) else c
-                        row += f"{nm:<25}"
-                    print(row)
-            except Exception as e: self._err(str(e))
+                print("  ".join(children) if children else col("  (empty)", "dim"))
+            except Exception as exc:
+                self._err(str(exc))
 
     def _cd(self, args):
-        """Cd.
-
-            Args:
-            args: Args.
-            """
-        t  = args[0] if args else self.env.get("HOME","/")
+        """Legacy directory change — prefer flat handles via ``data``."""
+        if not getattr(self, "_legacy_path_warned", False):
+            print(col(
+                "  note: cd is legacy; DataPy uses flat handles (data get|find)",
+                "yellow",
+            ))
+            self._legacy_path_warned = True
+        t = args[0] if args else self.env.get("HOME", "@")
+        if t in {"@", "/"}:
+            self.cwd = "@"
+            return
         rp = self._resolve(t)
-        if not self.sos.exists(rp): self._err(f"cd: {t}: No such object"); return
-        if not self.sos.is_dir(rp): self._err(f"cd: {t}: Not a directory-object"); return
+        if not self.sos.exists(rp):
+            self._err(f"cd: {t}: No such object")
+            return
+        if not self.sos.is_dir(rp):
+            self._err(f"cd: {t}: Not a directory-object")
+            return
         self.cwd = rp
 
-    """Pwd.
-
-        Args:
-        _:  .
-        """
     def _pwd(self, _): print(self.cwd)
 
     def _mkdir(self, args):
@@ -1165,7 +1224,13 @@ class NovaShell:
             elif sub == "lock":
                 mode = (rest[0] if rest else "status").lower()
                 if mode in ("on", "1", "true"):
-                    dp.lockdown(True); self._ok("capability lockdown ON")
+                    if dp._token is None:
+                        token = dp.bootstrap_admin(self.user)
+                        self._ok("capability lockdown ON (admin token issued)")
+                        print(col(f"  admin-token={token}", "yellow"))
+                    else:
+                        dp.lockdown(True)
+                        self._ok("capability lockdown ON")
                 elif mode in ("off", "0", "false"):
                     dp.lockdown(False); self._ok("capability lockdown OFF")
                 else:
@@ -1195,8 +1260,10 @@ class NovaShell:
                 print("  Usage: data put|get|up|rm|find|link|related|lock|grant|token")
         except DataPlaneError as exc:
             self._err(str(exc))
+            raise
         except Exception as exc:
             self._err(f"data: {exc}")
+            raise
 
     def _dashboard(self, args):
         """Dashboard.
@@ -1576,7 +1643,8 @@ class NovaShell:
 
         elif sub == "help" or (not args):
             print("  Usage:")
-            print(f"    {col('fix \'<problem>\'','cyan')}   — analyse + propose fixes")
+            fix_example = col("fix '<problem>'", "cyan")
+            print(f"    {fix_example}   — analyse + propose fixes")
             print(f"    {col('fix list','cyan')}             — show fix history")
             print(f"    {col('fix show <id>','cyan')}        — show fix details + outputs")
             print(f"    {col('fix rollback <id>','cyan')}    — roll back an applied fix")

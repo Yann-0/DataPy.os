@@ -12,6 +12,7 @@ CRUD is capability-gated when enforcement is enabled.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -85,6 +86,7 @@ class DataPlane:
         self.audit = audit
         self._token: str | None = None
         self._actor = "root"
+        self.last_ack = None
 
     # ── session ─────────────────────────────────────────────────────────────
 
@@ -93,10 +95,62 @@ class DataPlane:
         self._token = token
         self._actor = actor
 
+    def session(self, token: str | None, actor: str = "http") -> "DataPlane":
+        """Return a request-scoped plane that does not share this token."""
+        clone = DataPlane(
+            self.sos, self.caps, enforce=self.enforce, audit=self.audit
+        )
+        clone.use_token(token, actor=actor)
+        return clone
+
+    def bootstrap_admin(self, owner: str = "root") -> str:
+        """Mint a persisted admin token and enable lockdown.
+
+        Restarts stay locked; they do not become unrestricted. The returned
+        token is the trusted bootstrap credential and must be stored by the
+        operator.
+        """
+        if self.caps is None:
+            raise DataPlaneError("capability service unavailable")
+        cap = self.caps.grant(
+            "*",
+            {RIGHT_READ, RIGHT_WRITE, RIGHT_DELETE, "grant", "admin"},
+            owner=owner,
+            delegate_depth=8,
+        )
+        self.use_token(cap.token, actor=owner)
+        self.lockdown(True)
+        return cap.token
+
     def lockdown(self, enabled: bool = True) -> None:
-        """Enable or disable capability enforcement on the data plane."""
+        """Enable or disable capability enforcement and persist the mode."""
         self.enforce = enabled
         log.info("dataplane lockdown=%s", enabled)
+        self._persist_policy()
+
+    def _persist_policy(self) -> None:
+        try:
+            payload = json.dumps({
+                "lockdown": self.enforce,
+                "actor": self._actor,
+            })
+            self.sos.write(
+                "/security/policy.json",
+                payload,
+                kind="data",
+                tags=["security", "policy"],
+            )
+        except Exception as exc:
+            log.warning("could not persist security policy: %s", exc)
+
+    def load_policy(self) -> None:
+        """Restore lockdown from SOS so a restart is not unrestricted."""
+        try:
+            raw = self.sos.read("/security/policy.json")
+            data = json.loads(raw)
+            self.enforce = bool(data.get("lockdown", False))
+        except Exception:
+            pass
 
     # ── addressing ──────────────────────────────────────────────────────────
 
@@ -150,23 +204,40 @@ class DataPlane:
 
     # ── capability gate ─────────────────────────────────────────────────────
 
-    def _require(self, right: str, oid: str, handle: str) -> None:
-        if not self.enforce or self.caps is None:
+    def _require(self, right: str, oid: str, handle: str,
+                 *, creating: bool = False) -> None:
+        """Authorize before any mutation or success event.
+
+        Fail closed when enforcement is on and no capability service is
+        attached. Creating a new handle requires a token that already
+        covers that alias (or admin); an unrelated nonempty token is
+        not a bootstrap grant.
+        """
+        if not self.enforce:
             return
+        if self.caps is None:
+            raise DataPlaneError(
+                "capability service unavailable; denying (fail closed)"
+            )
         if not self._token:
             raise DataPlaneError(f"capability required for {right} on {handle}")
-        ok = self.caps.check(self._token, right, path=self.alias_of(handle))
-        if not ok:
-            # Also accept token bound to OID after first write.
-            cap = self.caps.get(self._token)
-            if (
-                cap
-                and cap.is_valid
-                and cap.has_right(right)
-                and (cap.target_oid == oid or cap.target_path == self.alias_of(handle))
-            ):
-                return
-            raise DataPlaneError(f"denied: {right} on {handle}")
+        alias = self.alias_of(handle) if handle and handle != oid else handle
+        ok = self.caps.check(self._token, right, path=alias)
+        if ok:
+            return
+        cap = self.caps.get(self._token)
+        if (
+            cap
+            and cap.is_valid
+            and cap.has_right(right)
+            and (
+                cap.target_oid == oid
+                or cap.target_path == alias
+                or cap.has_right("admin")
+            )
+        ):
+            return
+        raise DataPlaneError(f"denied: {right} on {handle}")
 
     def _log(self, action: str, handle: str, oid: str) -> None:
         if self.audit is None:
@@ -175,8 +246,11 @@ class DataPlane:
             self.audit.append(
                 action, self._actor, path=handle, detail=f"oid={oid}"
             )
+            if hasattr(self.audit, "flush"):
+                self.audit.flush()
         except Exception as exc:
-            log.debug("audit append failed: %s", exc)
+            log.error("mandatory audit append failed: %s", exc)
+            raise DataPlaneError(f"audit failure: {exc}") from exc
 
     # ── CRUD ────────────────────────────────────────────────────────────────
 
@@ -199,8 +273,8 @@ class DataPlane:
         existing = self.sos.resolve(alias)
         if existing:
             self._require(RIGHT_WRITE, existing, handle)
-        elif self.enforce and self.caps is not None and not self._token:
-            raise DataPlaneError(f"capability required to create {handle}")
+        else:
+            self._require(RIGHT_WRITE, "", handle, creating=True)
 
         tag_set = list({*(tags or []), "data", f"kind:{kind}", f"handle:{handle}"})
         oid = self.sos.write(
@@ -210,13 +284,13 @@ class DataPlane:
             tags=tag_set,
             meta=meta or {},
         )
+        self.last_ack = getattr(self.sos, "last_ack", None)
         if (
             self.caps is not None
             and existing is None
             and self._token is None
             and not self.enforce
         ):
-            # Dev-mode bootstrap: auto-grant CRUD on newly created object.
             cap = self.caps.grant(
                 alias,
                 {RIGHT_READ, RIGHT_WRITE, RIGHT_DELETE, "grant"},
@@ -225,12 +299,28 @@ class DataPlane:
             self._token = cap.token
 
         self._log("data.put", handle, oid)
-        return self.get(handle)
+        obj = self.sos.get(oid)
+        text = content.decode("utf-8") if isinstance(content, bytes) else str(content)
+        return DataRecord(
+            oid=oid,
+            handle=handle,
+            kind=kind,
+            content=text if isinstance(content, str) else (
+                content.decode("utf-8") if isinstance(content, bytes) else str(content)
+            ),
+            tags=list(getattr(obj, "tags", tag_set) or tag_set),
+            version=int(getattr(obj, "version", 1) or 1),
+            size=int(getattr(obj, "size", 0) or 0),
+            created_at=float(getattr(obj, "created_at", time.time()) or time.time()),
+        )
 
     def get(self, ref: str) -> DataRecord:
-        """Read an object by handle or OID."""
+        """Read an object by handle or OID with the same authority check."""
         oid, handle = self.resolve(ref)
-        self._require(RIGHT_READ, oid, handle if handle != oid else ref)
+        auth_handle = handle if handle != oid else (
+            self._handle_for_oid(oid) or oid
+        )
+        self._require(RIGHT_READ, oid, handle if handle != oid else auth_handle)
         obj = self.sos.get(oid)
         if obj is None:
             raise DataPlaneError(f"missing object: {ref}")
@@ -244,9 +334,10 @@ class DataPlane:
             text = str(content)
         tags = list(obj.tags) if hasattr(obj, "tags") else []
         self._log("data.get", handle, oid)
+        display = handle if handle != oid else (self._handle_for_oid(oid) or oid)
         return DataRecord(
             oid=oid,
-            handle=handle,
+            handle=display,
             kind=getattr(obj, "kind", "text") or "text",
             content=text,
             tags=tags,
@@ -254,6 +345,93 @@ class DataPlane:
             size=int(getattr(obj, "size", len(text)) or 0),
             created_at=float(getattr(obj, "created_at", time.time()) or time.time()),
         )
+
+    def _handle_for_oid(self, oid: str) -> str | None:
+        try:
+            conn = self.sos._pool.get()
+            row = conn.execute(
+                "SELECT path FROM aliases WHERE oid=? AND path LIKE '@%' LIMIT 1",
+                (oid,),
+            ).fetchone()
+            if row:
+                return str(row[0])[len(self.ALIAS_PREFIX):]
+        except Exception:
+            return None
+        return None
+
+    def _authorized_card(self, path: str, oid: str) -> dict[str, Any] | None:
+        handle = str(path)[len(self.ALIAS_PREFIX):]
+        try:
+            self._require(RIGHT_READ, oid, handle)
+        except DataPlaneError:
+            return None
+        return self._card(path, oid)
+
+    def find(
+        self,
+        *,
+        tag: str | None = None,
+        kind: str | None = None,
+        query: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Find objects. Multiple filters are intersected, then authorised.
+
+        ``limit`` applies after authorization so a caller cannot harvest
+        metadata of objects they cannot read by paging past denials.
+        """
+        sets: list[set[str]] = []
+
+        def _paths_from_tag(name: str) -> set[str]:
+            found: set[str] = set()
+            for path in self.sos.find_by_tag(name, fuzzy=False):
+                if str(path).startswith(self.ALIAS_PREFIX):
+                    found.add(str(path))
+            return found
+
+        if tag:
+            sets.append(_paths_from_tag(tag))
+        if kind:
+            sets.append(_paths_from_tag(f"kind:{kind}"))
+        if query:
+            qset: set[str] = set()
+            for hit in self.sos.keyword_search(query, limit=max(limit * 4, 50)):
+                path = hit.get("path") if isinstance(hit, dict) else None
+                if path and str(path).startswith(self.ALIAS_PREFIX):
+                    qset.add(str(path))
+            sets.append(qset)
+
+        if not sets:
+            try:
+                conn = self.sos._pool.get()
+                rows = conn.execute(
+                    "SELECT path, oid FROM aliases WHERE path LIKE '@%' "
+                    "AND ifnull(deleted,0)=0"
+                ).fetchall()
+                paths = [row[0] for row in rows]
+            except Exception as exc:
+                log.warning("dataplane list failed: %s", exc)
+                paths = []
+        else:
+            paths = list(set.intersection(*sets) if sets else set())
+
+        cards: list[dict[str, Any]] = []
+        skipped = 0
+        for path in paths:
+            oid = self.sos.resolve(path)
+            if not oid:
+                continue
+            card = self._authorized_card(path, oid)
+            if card is None:
+                continue
+            if skipped < offset:
+                skipped += 1
+                continue
+            cards.append(card)
+            if len(cards) >= limit:
+                break
+        return cards
 
     def update(
         self,
@@ -287,72 +465,6 @@ class DataPlane:
         self.sos.remove(self.alias_of(handle))
         self._log("data.delete", handle, oid)
         return oid
-
-    def find(
-        self,
-        *,
-        tag: str | None = None,
-        kind: str | None = None,
-        query: str | None = None,
-        limit: int = 50,
-    ) -> list[dict[str, Any]]:
-        """Find objects by tag, kind, and/or full-text query (no directories)."""
-        results: list[dict[str, Any]] = []
-        seen: set[str] = set()
-
-        if tag:
-            for path in self.sos.find_by_tag(tag):
-                if not str(path).startswith(self.ALIAS_PREFIX):
-                    continue
-                oid = self.sos.resolve(path)
-                if not oid or oid in seen:
-                    continue
-                seen.add(oid)
-                results.append(self._card(path, oid))
-
-        if kind:
-            for path in self.sos.find_by_tag(f"kind:{kind}"):
-                if not str(path).startswith(self.ALIAS_PREFIX):
-                    continue
-                oid = self.sos.resolve(path)
-                if not oid or oid in seen:
-                    continue
-                seen.add(oid)
-                results.append(self._card(path, oid))
-
-        if query:
-            for hit in self.sos.keyword_search(query, limit=limit):
-                path = hit.get("path") if isinstance(hit, dict) else None
-                if not path:
-                    # Some SOS versions return (path, snippet) tuples.
-                    path = hit[0] if isinstance(hit, (list, tuple)) else None
-                if not path or not str(path).startswith(self.ALIAS_PREFIX):
-                    continue
-                oid = self.sos.resolve(path)
-                if not oid or oid in seen:
-                    continue
-                seen.add(oid)
-                results.append(self._card(path, oid))
-
-        if not tag and not kind and not query:
-            # List all data handles.
-            try:
-                conn = self.sos._pool.get()
-                rows = conn.execute(
-                    "SELECT path, oid FROM aliases WHERE path LIKE '@%' "
-                    "AND is_dir = 0 LIMIT ?",
-                    (limit,),
-                ).fetchall()
-                for row in rows:
-                    path, oid = row[0], row[1]
-                    if oid in seen:
-                        continue
-                    seen.add(oid)
-                    results.append(self._card(path, oid))
-            except Exception as exc:
-                log.warning("dataplane list failed: %s", exc)
-
-        return results[:limit]
 
     def link(self, src: str, dst: str, relation: str = "ref") -> None:
         """Create a graph edge between two flat handles."""

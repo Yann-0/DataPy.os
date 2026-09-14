@@ -28,7 +28,7 @@ Shell commands:
 """
 
 from __future__ import annotations
-import os, sys, time, json, re, hashlib, threading
+import os, sys, time, json, re, hashlib, threading, uuid
 from typing import List, Dict, Optional, Any, TYPE_CHECKING
 from dataclasses import dataclass, field
 
@@ -148,9 +148,7 @@ class AutonomousAgent:
 
     def _new_id(self) -> str:
         """Generate a unique run ID."""
-        return hashlib.sha256(
-            f"{time.time()}".encode()
-        ).hexdigest()[:8]
+        return uuid.uuid4().hex[:8]
 
     def _ask_ai(self, prompt: str, max_tokens: int = 600) -> str:
         """Query the AI engine."""

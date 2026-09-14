@@ -49,15 +49,34 @@ Fixes applied:
   7. WAL pragma set once at pool creation, not per connection
 """
 
-import os, time, json, hashlib, sqlite3, threading
+from __future__ import annotations
+
+import logging
+import os, time, json, hashlib, sqlite3, threading, uuid
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple, Any
 from functools import lru_cache
 
-DATA_DIR = os.environ.get("NOVA_DATA", os.path.expanduser("~/.nova"))
-DB_PATH  = os.path.join(DATA_DIR, "sos.db")
+from store.migration import SCHEMA_VERSION, ensure_revision_tables
+
+log = logging.getLogger("nova.sos")
+
 LRU_OBJ_SIZE  = 2048   # max cached SObject instances
 LRU_PATH_SIZE = 4096   # max cached path→OID mappings
+
+
+def _default_data_dir() -> str:
+    """Return NOVA_DATA at call time (never freeze ~/.nova at import)."""
+    return os.environ.get("NOVA_DATA", os.path.expanduser("~/.nova"))
+
+
+def _default_db_path() -> str:
+    """Return the default SOS database path from the current environment."""
+    return os.path.join(_default_data_dir(), "sos.db")
+
+
+DATA_DIR = _default_data_dir()
+DB_PATH = _default_db_path()
 
 # ─────────────────────────────────────────────────── data model
 @dataclass
@@ -121,6 +140,24 @@ class SObject:
                 float: Result.
             """
         return self.created_at
+
+
+@dataclass
+class WriteAck:
+    """Acknowledgement of a write: queued vs durable commit.
+
+    ``durable`` is true only after SQLite COMMIT. ``queued`` is true when
+    the write was accepted by a write-ahead queue and is not yet on disk.
+    ``noop`` is true when identical content and metadata were already head.
+    """
+
+    oid: str
+    rev_id: str
+    path: str
+    durable: bool
+    queued: bool = False
+    noop: bool = False
+    version: int = 1
 
 
 def _oid(content: bytes) -> str:
@@ -344,114 +381,125 @@ class SemanticObjectStore:
             db_path: Path to the SQLite database file.  Defaults to
                      ``$NOVA_DATA/sos.db``.
         """
-        self.db_path = db_path or DB_PATH
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        self.db_path = db_path or _default_db_path()
+        parent = os.path.dirname(self.db_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         self._lock        = threading.Lock()
         self._pool        = _ConnPool(self.db_path)
         self._obj_cache   = _LRUDict(LRU_OBJ_SIZE)   # FIX 3: bounded LRU
         self._path_cache  = _LRUDict(LRU_PATH_SIZE)  # FIX 2: alias cache
+        self._rev_cache    = _LRUDict(LRU_OBJ_SIZE)
+        self.last_ack: Optional[WriteAck] = None
         self._init_db()
         self._seed_default_tree()
 
     # ─────────────────────── DB init
     def _init_db(self):
-        """Initialise db."""
+        """Initialise schema, revision tables, and schema version."""
         with self._lock:
             conn = self._pool.get()
             conn.executescript(SCHEMA)
+            ensure_revision_tables(conn)
+            conn.execute(
+                "INSERT OR REPLACE INTO nova_meta(key,value) VALUES (?,?)",
+                ("schema_version", str(SCHEMA_VERSION)),
+            )
             conn.commit()
 
     # ─────────────────────── store
     def store(self, content: bytes | str, kind: str = "text",
               meta: dict = None, tags: List[str] = None,
               links: List[str] = None, parent_oid: str = None) -> str:
-        """Store.
+        """Store an immutable content blob.
 
-            Args:
-            content (bytes | str): Content.
-            kind (str): Kind, defaults to 'text'.
-            meta (dict): Meta, defaults to None.
-            tags (List[str]): Tags, defaults to None.
-            links (List[str]): Links, defaults to None.
-            parent_oid (str): Parent oid, defaults to None.
-
-
-            Returns:
-                str: Result.
-            """
+        Blob identity is the 32-hex SHA-256 prefix. INSERT OR IGNORE keeps
+        the first copy of the bytes; revision metadata is not stored here.
+        """
         if isinstance(content, str):
             content = content.encode()
         oid   = _oid(content)
         meta  = meta  or {}
         tags  = [t.lower().strip() for t in (tags or []) if t.strip()]
         links = links or []
-        version = 1
-        if parent_oid:
-            parent = self.get(parent_oid)
-            if parent:
-                version = parent.version + 1
+        now = time.time()
         obj = SObject(oid=oid, content=content, kind=kind, meta=meta, tags=tags,
-                      links=links, parent_oid=parent_oid, version=version,
-                      created_at=time.time(), size=len(content))
+                      links=links, parent_oid=parent_oid, version=1,
+                      created_at=now, size=len(content))
         with self._lock:
             conn = self._pool.get()
             conn.execute(
                 "INSERT OR IGNORE INTO objects "
-                "(oid,content,kind,meta_json,tags_json,links_json,parent_oid,version,created_at,size) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "(oid,content,kind,meta_json,tags_json,links_json,parent_oid,"
+                "version,created_at,size) VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (oid, content, kind, json.dumps(meta), json.dumps(tags),
-                 json.dumps(links), parent_oid, version, obj.created_at, obj.size))
-            for tag in tags:
-                conn.execute("INSERT OR IGNORE INTO tag_index (tag,oid) VALUES (?,?)", (tag, oid))
-            for dst in links:
-                conn.execute("INSERT OR IGNORE INTO links (src_oid,dst_oid,relation) VALUES (?,?,?)",
-                             (oid, dst, "ref"))
-            # FIX 4: maintain FTS index
-            if kind != "dir" and content:
-                text_preview = content.decode("utf-8", errors="replace")[:4096]
-                conn.execute("INSERT OR REPLACE INTO fts(oid,content) VALUES (?,?)",
-                             (oid, text_preview))
+                 json.dumps(links), parent_oid, 1, now, obj.size))
+            conn.execute(
+                "INSERT OR IGNORE INTO blobs (oid,content,size) VALUES (?,?,?)",
+                (oid, content, obj.size),
+            )
             conn.commit()
-        self._obj_cache.set(oid, obj)
+        if self._obj_cache.get(oid) is None:
+            self._obj_cache.set(oid, obj)
         return oid
 
     def update(self, path: str, content: bytes | str, **kwargs) -> str:
-        """Update the operation.
+        """Update path content by writing a new revision."""
+        return self.write(path, content, **kwargs)
 
-            Args:
-            path (str): Path.
-            content (bytes | str): Content.
+    def _head_rev(self, conn: sqlite3.Connection, path: str):
+        row = conn.execute(
+            "SELECT head_rev FROM aliases WHERE path=?", (path,)
+        ).fetchone()
+        if not row or not row[0]:
+            return None
+        return conn.execute(
+            "SELECT * FROM revisions WHERE rev_id=?", (row[0],)
+        ).fetchone()
 
+    def _sobject_from_rev(self, conn: sqlite3.Connection, rev, content: bytes) -> SObject:
+        parent_oid = None
+        if rev["parent_rev"]:
+            prow = conn.execute(
+                "SELECT blob_oid FROM revisions WHERE rev_id=?",
+                (rev["parent_rev"],),
+            ).fetchone()
+            if prow:
+                parent_oid = prow["blob_oid"]
+        return SObject(
+            oid=rev["blob_oid"], content=content, kind=rev["kind"],
+            meta=json.loads(rev["meta_json"] or "{}"),
+            tags=json.loads(rev["tags_json"] or "[]"),
+            links=json.loads(rev["links_json"] or "[]"),
+            parent_oid=parent_oid, version=rev["version"],
+            created_at=rev["created_at"], size=len(content),
+        )
 
-            Returns:
-                str: Result.
-            """
-        old_oid = self.resolve(path)
-        new_oid = self.store(content, parent_oid=old_oid, **kwargs)
-        if new_oid != old_oid:
-            with self._lock:
-                conn = self._pool.get()
-                conn.execute("UPDATE aliases SET oid=? WHERE path=?", (new_oid, path))
-                conn.commit()
-            self._path_cache.set(path, new_oid)   # update cache in place
-        return new_oid
-
-    # ─────────────────────── retrieve
     def get(self, oid: str) -> Optional[SObject]:
-        """Return the the operation.
-
-            Args:
-            oid (str): Oid.
-
-
-            Returns:
-                Optional[SObject]: Result.
-            """
-        cached = self._obj_cache.get(oid)
-        if cached is not None:
-            return cached
+        """Return the latest revision view of a blob, or the blob itself."""
         conn = self._pool.get()
-        row  = conn.execute("SELECT * FROM objects WHERE oid=?", (oid,)).fetchone()
+        rev = conn.execute(
+            "SELECT * FROM revisions WHERE blob_oid=? AND deleted=0 "
+            "ORDER BY version DESC, created_at DESC LIMIT 1",
+            (oid,),
+        ).fetchone()
+        blob = conn.execute(
+            "SELECT content, size FROM blobs WHERE oid=?", (oid,)
+        ).fetchone()
+        if blob is None:
+            blob = conn.execute(
+                "SELECT content, size FROM objects WHERE oid=?", (oid,)
+            ).fetchone()
+        if rev is not None and blob is not None:
+            obj = self._sobject_from_rev(conn, rev, blob["content"])
+            self._obj_cache.set(oid, obj)
+            return obj
+        cached = self._obj_cache.get(oid)
+        if cached is not None and rev is None:
+            return cached
+        if not blob:
+            return None
+        row = conn.execute("SELECT * FROM objects WHERE oid=?", (oid,)).fetchone()
         if not row:
             return None
         obj = SObject(
@@ -614,49 +662,136 @@ class SemanticObjectStore:
     # written to different paths shares a single objects row.
     def write(self, path: str, content: bytes | str, kind: str = "text",
               meta: dict = None, tags: List[str] = None) -> str:
-        """Write the operation.
+        """Write content to a handle/path, creating a unique revision.
 
-            Args:
-            path (str): Path.
-            content (bytes | str): Content.
-            kind (str): Kind, defaults to 'text'.
-            meta (dict): Meta, defaults to None.
-            tags (List[str]): Tags, defaults to None.
-
-
-            Returns:
-                str: Result.
-            """
+        Returns the blob OID. Identical content+metadata at the current head
+        is a no-op. Same bytes under a new handle still share the blob.
+        """
         if isinstance(content, str):
             content = content.encode()
-        m = meta or {}
-        m.setdefault("name", path.rsplit("/", 1)[-1])
+        m = dict(meta or {})
+        m.setdefault("name", path.rsplit("/", 1)[-1] if "/" in path else path)
         m.setdefault("path", path)
-        old_oid = self.resolve(path)
-        oid     = self.store(content, kind=kind, meta=m, tags=tags or [], parent_oid=old_oid)
-        self.alias(path, oid)
-        parent = path.rsplit("/", 1)[0]
-        if parent and parent != path:
+        tags = [t.lower().strip() for t in (tags or []) if t.strip()]
+        blob_oid = _oid(content)
+        with self._lock:
+            conn = self._pool.get()
+            head = self._head_rev(conn, path)
+            if head is not None:
+                same_blob = head["blob_oid"] == blob_oid
+                same_meta = (
+                    head["kind"] == kind
+                    and json.loads(head["tags_json"] or "[]") == tags
+                    and json.loads(head["meta_json"] or "{}") == m
+                )
+                if same_blob and same_meta:
+                    ack = WriteAck(
+                        oid=blob_oid, rev_id=head["rev_id"], path=path,
+                        durable=True, queued=False, noop=True,
+                        version=head["version"],
+                    )
+                    self.last_ack = ack
+                    return blob_oid
+            version = (head["version"] + 1) if head is not None else 1
+            parent_rev = head["rev_id"] if head is not None else None
+            parent_oid = head["blob_oid"] if head is not None else None
+            now = time.time()
+            rev_id = uuid.uuid4().hex
+            conn.execute(
+                "INSERT OR IGNORE INTO objects "
+                "(oid,content,kind,meta_json,tags_json,links_json,parent_oid,"
+                "version,created_at,size) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (blob_oid, content, kind, json.dumps(m), json.dumps(tags),
+                 json.dumps([]), parent_oid, version, now, len(content)),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO blobs (oid,content,size) VALUES (?,?,?)",
+                (blob_oid, content, len(content)),
+            )
+            conn.execute(
+                "INSERT INTO revisions "
+                "(rev_id,blob_oid,path,parent_rev,kind,meta_json,tags_json,"
+                "links_json,version,created_at,deleted) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,0)",
+                (rev_id, blob_oid, path, parent_rev, kind, json.dumps(m),
+                 json.dumps(tags), json.dumps([]), version, now),
+            )
+            is_dir = int(kind == "dir")
+            conn.execute(
+                "INSERT OR REPLACE INTO aliases "
+                "(path, oid, is_dir, head_rev, deleted) VALUES (?,?,?,?,0)",
+                (path, blob_oid, is_dir, rev_id),
+            )
+            conn.execute("DELETE FROM tag_by_path WHERE path=?", (path,))
+            for tag in tags:
+                conn.execute(
+                    "INSERT OR IGNORE INTO tag_by_path (tag, path) VALUES (?,?)",
+                    (tag, path),
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO tag_index (tag,oid) VALUES (?,?)",
+                    (tag, blob_oid),
+                )
+            if kind != "dir" and content:
+                text_preview = content.decode("utf-8", errors="replace")[:4096]
+                conn.execute(
+                    "INSERT OR REPLACE INTO fts(oid,content) VALUES (?,?)",
+                    (blob_oid, text_preview),
+                )
+            conn.commit()
+        obj = SObject(
+            oid=blob_oid, content=content, kind=kind, meta=m, tags=tags,
+            links=[], parent_oid=parent_oid, version=version,
+            created_at=now, size=len(content),
+        )
+        self._obj_cache.set(blob_oid, obj)
+        self._rev_cache.set(rev_id, obj)
+        self._path_cache.set(path, blob_oid)
+        parent = path.rsplit("/", 1)[0] if "/" in path else ""
+        if parent and parent != path and kind != "dir":
             self._ensure_dir(parent)
-        return oid
+        self.last_ack = WriteAck(
+            oid=blob_oid, rev_id=rev_id, path=path,
+            durable=True, queued=False, noop=False, version=version,
+        )
+        return blob_oid
+
+    def flush(self, barrier: bool = True) -> WriteAck | None:
+        """Drain optional queues and optionally checkpoint the WAL.
+
+        Product writes go through ``write()`` and are durable on return.
+        ``barrier=True`` runs ``PRAGMA wal_checkpoint(TRUNCATE)`` so readers
+        on a reopen see committed pages. Returns ``last_ack`` if any.
+        """
+        waq = getattr(self, "_waq", None)
+        if waq is not None and hasattr(waq, "flush"):
+            try:
+                waq.flush(force=True)
+            except Exception as exc:
+                log.warning("waq flush during barrier failed: %s", exc)
+        if barrier:
+            with self._lock:
+                conn = self._pool.get()
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                conn.commit()
+        return getattr(self, "last_ack", None)
 
     def stat(self, path: str) -> dict:
-        """Stat.
-
-            Args:
-            path (str): Path.
-
-
-            Returns:
-                dict: Result.
-            """
-        oid = self.resolve(path)
-        if not oid:
+        """Return handle-scoped metadata from the current revision."""
+        conn = self._pool.get()
+        rev = self._head_rev(conn, path)
+        if rev is None:
             raise FileNotFoundError(f"sos: {path}: No such object")
-        obj = self.get(oid)
-        return {"oid": obj.oid, "kind": obj.kind, "size": obj.size,
-                "version": obj.version, "tags": obj.tags,
-                "mtime": obj.created_at, "links": len(obj.links)}
+        blob = conn.execute(
+            "SELECT size FROM blobs WHERE oid=?", (rev["blob_oid"],)
+        ).fetchone()
+        tags = json.loads(rev["tags_json"] or "[]")
+        links = json.loads(rev["links_json"] or "[]")
+        return {"oid": rev["blob_oid"], "kind": rev["kind"],
+                "size": blob["size"] if blob else 0,
+                "version": rev["version"], "tags": tags,
+                "mtime": rev["created_at"], "links": len(links),
+                "rev_id": rev["rev_id"]}
 
     def mkdir(self, path: str, parents: bool = False):
         """Mkdir.
@@ -739,23 +874,33 @@ class SemanticObjectStore:
 
     # ─────────────────────── version history
     def history(self, path: str) -> List[SObject]:
-        """History.
-
-            Args:
-            path (str): Path.
-
-
-            Returns:
-                List[SObject]: Result.
-            """
-        oid   = self.resolve(path)
-        chain = []
-        while oid:
-            obj = self.get(oid)
-            if not obj:
+        """Return revisions for a path, newest first, walking predecessor revs."""
+        conn = self._pool.get()
+        head = self._head_rev(conn, path)
+        if head is None:
+            return []
+        chain: List[SObject] = []
+        seen: set[str] = set()
+        rev = head
+        while rev is not None:
+            if rev["rev_id"] in seen:
                 break
-            chain.append(obj)
-            oid = obj.parent_oid
+            seen.add(rev["rev_id"])
+            blob = conn.execute(
+                "SELECT content FROM blobs WHERE oid=?", (rev["blob_oid"],)
+            ).fetchone()
+            if blob is None:
+                blob = conn.execute(
+                    "SELECT content FROM objects WHERE oid=?", (rev["blob_oid"],)
+                ).fetchone()
+            if blob is None:
+                break
+            chain.append(self._sobject_from_rev(conn, rev, blob["content"]))
+            if not rev["parent_rev"]:
+                break
+            rev = conn.execute(
+                "SELECT * FROM revisions WHERE rev_id=?", (rev["parent_rev"],)
+            ).fetchone()
         return chain
 
     def checkout(self, path: str, version: int) -> Optional[SObject]:
@@ -843,9 +988,24 @@ class SemanticObjectStore:
                 t = t.strip().lower()
                 if not t:
                     continue
-                conn.execute("INSERT OR IGNORE INTO tag_index (tag,oid) VALUES (?,?)", (t, oid))
+                conn.execute(
+                    "INSERT OR IGNORE INTO tag_by_path (tag, path) VALUES (?,?)",
+                    (t, path),
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO tag_index (tag,oid) VALUES (?,?)",
+                    (t, oid),
+                )
                 if conn.execute("SELECT changes()").fetchone()[0]:
                     added.append(t)
+            head = self._head_rev(conn, path)
+            if head is not None and added:
+                current = json.loads(head["tags_json"] or "[]")
+                merged = list(dict.fromkeys([*current, *added]))
+                conn.execute(
+                    "UPDATE revisions SET tags_json=? WHERE rev_id=?",
+                    (json.dumps(merged), head["rev_id"]),
+                )
             conn.commit()
         return added
 
@@ -867,28 +1027,33 @@ class SemanticObjectStore:
             conn = self._pool.get()
             for t in tags:
                 t = t.strip().lower()
-                conn.execute("DELETE FROM tag_index WHERE tag=? AND oid=?", (t, oid))
+                conn.execute("DELETE FROM tag_by_path WHERE tag=? AND path=?", (t, path))
                 if conn.execute("SELECT changes()").fetchone()[0]:
                     removed.append(t)
+            head = self._head_rev(conn, path)
+            if head is not None:
+                current = [x for x in json.loads(head["tags_json"] or "[]") if x not in removed]
+                conn.execute(
+                    "UPDATE revisions SET tags_json=? WHERE rev_id=?",
+                    (json.dumps(current), head["rev_id"]),
+                )
             conn.commit()
         return removed
 
     def get_tags(self, path: str) -> List[str]:
-        """Return the tags.
-
-            Args:
-            path (str): Path.
-
-
-            Returns:
-                List[str]: Result.
-            """
+        """Return tags attached to this handle's current revision."""
+        conn = self._pool.get()
+        rows = conn.execute(
+            "SELECT tag FROM tag_by_path WHERE path=? ORDER BY tag", (path,)
+        ).fetchall()
+        if rows:
+            return [r["tag"] for r in rows]
         oid = self.resolve(path)
         if not oid:
             return []
-        conn = self._pool.get()
-        rows = conn.execute("SELECT tag FROM tag_index WHERE oid=? ORDER BY tag",
-                            (oid,)).fetchall()
+        rows = conn.execute(
+            "SELECT tag FROM tag_index WHERE oid=? ORDER BY tag", (oid,)
+        ).fetchall()
         return [r["tag"] for r in rows]
 
     def find_by_tag(self, tag: str, fuzzy: bool = True) -> List[str]:
@@ -902,15 +1067,29 @@ class SemanticObjectStore:
             Returns:
                 List[str]: Result.
             """
+        paths = []
         conn = self._pool.get()
+        if fuzzy:
+            rows = conn.execute(
+                "SELECT DISTINCT path FROM tag_by_path WHERE tag LIKE ?",
+                (f"%{tag}%",)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT DISTINCT path FROM tag_by_path WHERE tag=?", (tag,)
+            ).fetchall()
+        for row in rows:
+            paths.append(row["path"])
+        if paths:
+            return paths
+        # Legacy fallback: tag_index is blob-scoped.
         if fuzzy:
             rows = conn.execute(
                 "SELECT DISTINCT oid FROM tag_index WHERE tag LIKE ?",
                 (f"%{tag}%",)).fetchall()
         else:
             rows = conn.execute(
-                "SELECT DISTINCT oid FROM tag_index WHERE tag=?", (tag,)).fetchall()
-        paths = []
+                "SELECT DISTINCT oid FROM tag_index WHERE tag=?", (tag,)
+            ).fetchall()
         for row in rows:
             obj = self.get(row["oid"])
             if obj:
@@ -931,16 +1110,21 @@ class SemanticObjectStore:
         return [{"tag": r["tag"], "count": r["cnt"]} for r in rows]
 
     # ─────────────────────── FIX 4: FTS5 search
-    def keyword_search(self, query: str, n: int = 10) -> List[Dict]:
-        """Full-text search via SQLite FTS5 — no Python BLOB scanning."""
+    def keyword_search(self, query: str, n: int = 10, limit: int | None = None,
+                       **_kwargs) -> List[Dict]:
+        """Full-text search via SQLite FTS5.
+
+        ``limit`` is accepted as an alias of ``n`` (DataPlane historically
+        passed ``limit=`` while this method only declared ``n``).
+        """
+        cap     = n if limit is None else limit
         conn    = self._pool.get()
         results = []
         try:
-            # Try FTS5 first
             rows = conn.execute(
                 "SELECT oid, snippet(fts,1,'>>','<<','...',10) AS snip "
                 "FROM fts WHERE fts MATCH ? LIMIT ?",
-                (query, n)).fetchall()
+                (query, cap)).fetchall()
             for row in rows:
                 obj = self.get(row["oid"])
                 if obj:
@@ -952,15 +1136,14 @@ class SemanticObjectStore:
                         "tags":    obj.tags,
                     })
             if results:
-                return results
+                return results[:cap]
         except sqlite3.OperationalError:
             pass
 
-        # Fallback: LIKE-based search on text content only (no full BLOB scan)
         terms = query.lower().split()
         like_clause = " AND ".join(
             f"LOWER(CAST(content AS TEXT)) LIKE ?" for _ in terms)
-        like_args   = [f"%{t}%" for t in terms] + [n]
+        like_args   = [f"%{t}%" for t in terms] + [cap]
         try:
             rows = conn.execute(
                 f"SELECT oid, content FROM objects WHERE kind!='dir' AND {like_clause} LIMIT ?",
@@ -978,7 +1161,7 @@ class SemanticObjectStore:
                 })
         except Exception:
             pass
-        return results[:n]
+        return results[:cap]
 
     def _snippet(self, text: str, terms: list) -> str:
         """Snippet.

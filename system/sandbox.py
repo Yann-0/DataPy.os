@@ -132,8 +132,16 @@ class Sandbox:
 
         if self._has_ns:
             result = self._run_in_namespace(code, args or [])
-        else:
+        elif os.environ.get("NOVA_SANDBOX_TRUSTED_DEV") == "1":
             result = self._run_in_exec(code, args or [])
+        else:
+            self._status = "rejected"
+            return SandboxResult(
+                self.id, 1, "",
+                "untrusted execution rejected: process isolation unavailable "
+                "(set NOVA_SANDBOX_TRUSTED_DEV=1 for labelled opt-in)",
+                time.time() - start,
+            )
 
         self._status = "done"
         result.duration = time.time() - start
@@ -173,8 +181,11 @@ class Sandbox:
             return SandboxResult(self.id, 124, "",
                                   "Sandbox timeout exceeded", 0)
         except FileNotFoundError:
-            # unshare not available — fall back
-            return self._run_in_exec(code, args)
+            return SandboxResult(
+                self.id, 1, "",
+                "untrusted execution rejected: unshare(1) unavailable",
+                0,
+            )
         except Exception as e:
             return SandboxResult(self.id, 1, "", str(e), 0)
         finally:

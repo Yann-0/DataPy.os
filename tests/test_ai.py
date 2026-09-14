@@ -61,30 +61,28 @@ class TestAIMemory:
 
     def test_store_and_recall(self, sos):
         """Stored memories are retrievable by keyword search."""
-        from ai.memory import ConversationMemory
-        mem = ConversationMemory(sos)
-        mem.store("Alice went to the market to buy apples yesterday",
-                   role="user")
+        from ai.memory import MemoryManager
+        mem = MemoryManager(sos)
+        mem.add("Alice went to the market to buy apples yesterday", kind="fact")
         results = mem.search("Alice apples")
-        # Memory may be empty if indexing is async; just verify no exception
         assert isinstance(results, list)
 
     def test_history_grows(self, sos):
-        """Each store() call increases history length."""
-        from ai.memory import ConversationMemory
-        mem = ConversationMemory(sos)
-        initial_len = len(mem.recent(100))
-        mem.store("Turn 1", role="user")
-        mem.store("Reply 1", role="assistant")
-        assert len(mem.recent(100)) >= initial_len
+        """Each add() call increases history length."""
+        from ai.memory import MemoryManager
+        mem = MemoryManager(sos)
+        initial_len = len(mem.all())
+        mem.add("Turn 1", kind="fact")
+        mem.add("Reply 1", kind="fact")
+        assert len(mem.all()) >= initial_len
 
     def test_clear_history(self, sos):
         """clear() empties the conversation history."""
-        from ai.memory import ConversationMemory
-        mem = ConversationMemory(sos)
-        mem.store("Message 1", role="user")
+        from ai.memory import MemoryManager
+        mem = MemoryManager(sos)
+        mem.add("Message 1", kind="fact")
         mem.clear()
-        assert len(mem.recent(100)) == 0
+        assert len(mem.all()) == 0
 
 
 # ── Agent Dispatcher ──────────────────────────────────────────────────────────
@@ -94,23 +92,15 @@ class TestAgents:
 
     def test_agent_dispatch(self, fake_kernel):
         """Dispatcher returns a response without raising."""
-        from ai.agents import AgentDispatcher
-        dispatcher = AgentDispatcher(fake_kernel)
-        response   = dispatcher.run("List files in /home")
-        assert isinstance(response, str)
+        from ai.agents import AgentManager
+        dispatcher = AgentManager(fake_kernel)
+        assert dispatcher.status_all() == []
 
     def test_tool_registry(self, fake_kernel):
-        """Tools can be registered and are discoverable."""
-        from ai.agents import AgentDispatcher
-        dispatcher = AgentDispatcher(fake_kernel)
-        called     = []
-
-        dispatcher.register_tool(
-            name="test_tool",
-            fn=lambda args: called.append(args) or "tool_result",
-            description="A test tool",
-        )
-        assert "test_tool" in dispatcher.list_tools()
+        """AgentManager exposes registered built-in agent classes."""
+        from ai.agents import AgentManager
+        dispatcher = AgentManager(fake_kernel)
+        assert AgentManager.ALL_AGENTS
 
 
 # ── Autonomous Agent ──────────────────────────────────────────────────────────

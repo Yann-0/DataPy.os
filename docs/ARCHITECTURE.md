@@ -1,22 +1,31 @@
-# PyOS NOVA — Architecture Guide
+# DataPy.os — Architecture Guide
 
 ## Overview
 
-PyOS NOVA is a research operating system where Python replaces `/sbin/init`.
-On a real machine, `boot/pyinit.py` is the first userspace process (PID 1).
-On a developer workstation, `python3 main.py` starts the full kernel in-process.
+DataPy.os is a **data-native OS**: **data + Python + AI**. It is not another
+Linux distribution. Product identity and roadmap: `docs/PRODUCT.md`.
+
+The OS is defined by three layers (in priority order):
+
+1. **SOS** — content-addressed blobs, unique revisions, tags, links (the filesystem)
+2. **DataPlane** — authorized CRUD over flat handles (primary I/O surface)
+3. **NovaKernel** — Python kernel that owns subsystems, shell, and AI
+
+Bring-up (host CPython, Pi Linux kernel + Python PID-1, experimental UEFI)
+only starts Python. Optimizations belong in SOS / DataPlane / kernel / AI.
 
 ```
-Hardware / UEFI
+NovaKernel (kernel/nova.py)
       ↓
-boot/efi_builder.py    PE32+ EFI binary (x86-64 / ARM64 / RISC-V)
+DataPlane (store/dataplane.py)   ← primary surface
       ↓
-boot/pyinit.py         PID 1 — mounts filesystems, starts kernel
+SOS (store/sos.py)               ← the filesystem
       ↓
-kernel/nova.py         NovaKernel — owns all subsystems
-      ↓
-shell/nova_shell.py    Interactive shell (120+ commands)
+Shell / AI / APIs
 ```
+
+Host development: `python3 main.py`. Pi image: Linux is a thin host so
+`boot/pyinit.py` can run as PID-1. Firmware-native UEFI remains experimental.
 
 ---
 
@@ -24,9 +33,9 @@ shell/nova_shell.py    Interactive shell (120+ commands)
 
 ### Semantic Object Store (SOS)
 
-The SOS is NOVA's filesystem, database, and version-control system in one.
-Every object is content-addressed by SHA-256 of its content, stored in
-SQLite WAL mode, and automatically versioned.
+The SOS is DataPy's filesystem, database, and version-control system in one.
+Blobs are content-addressed; each write creates a unique revision. Handles
+point at revision heads. Collections are tags and graph links — not folders.
 
 ```
 /store/sos.py              Core store: write, read, resolve, search
@@ -94,30 +103,38 @@ secrets. The Merkle-chained ledger provides tamper-evident audit trails.
 ### Networking
 
 ```
-/net/server.py         REST API + SOS file server (HTTP)
-/net/ssh_server.py     SSH server (paramiko + TCP fallback)
+/net/server.py         REST API via DataPlane (loopback default)
+/net/ssh_server.py     SSH server (paramiko required; no TCP fallback)
 /net/discovery.py      mDNS service discovery, API gateway, DNS
-/net/crdt.py           CRDT-based distributed SOS sync
+/net/crdt.py           CRDT-based distributed SOS sync (not a Raft log)
 /net/innovations.py    P2P mesh (content-addressed), WebSocket, TOFU, 2PC
 /net/http_client.py    HTTP client, health server, distributed replicator
 ```
 
 ---
 
-## Boot Sequence
+## Bring-up (not the product)
+
+### Host (primary development)
 
 ```
-1. UEFI firmware loads boot/BOOTX64.EFI (PE32+ Python stub)
-2. EFI stub launches python3 boot/pyinit.py as PID 1
-3. pyinit mounts the SOS database at /nova/data/
-4. pyinit checks SOS integrity (WAL recovery if corrupt)
-5. pyinit imports kernel/nova.py and calls NovaKernel.boot()
-6. NovaKernel initialises subsystems in dependency order:
-     SOS → EventBus → WAQ → AI → Scheduler → Watchdog → i18n → ...
-7. NovaKernel starts the shell, REST API, SSH, metrics server
-8. Control returns to pyinit which enters a wait loop
-   (restarting the kernel on crash with exponential back-off)
+python main.py --no-ai
+  → NovaKernel → SOS + DataPlane → shell / --cmd / optional REST
 ```
+
+Persistent application data is always under `NOVA_DATA` via SOS, never ad-hoc
+`open()` for OS objects.
+
+### Pi 5 (hardware bring-up only)
+
+```
+1. Firmware loads a Linux kernel + initramfs (transport only)
+2. PID 1 is Python (boot/pyinit.py)
+3. Mount labelled NOVA_DATA, start NovaKernel
+4. SOS / DataPlane / shell — same product as on the host
+```
+
+Firmware-native UEFI is experimental and is not a supported runtime.
 
 ---
 

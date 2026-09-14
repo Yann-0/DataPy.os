@@ -20,6 +20,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+os.environ.setdefault("NOVA_NO_AI", "1")
+if "NOVA_DATA" not in os.environ:
+    os.environ["NOVA_DATA"] = tempfile.mkdtemp(prefix="nova_data_")
+
 
 # ── environment isolation ─────────────────────────────────────────────────────
 
@@ -131,10 +135,80 @@ class _FakeKernel:
         self.ai     = _FakeAI()
         self.user   = "root"
         self.cwd    = "/home/root"
-
-        # Lazy stubs — only created if accessed
         self._tracer  = None
         self._prefetch = None
+        self._tenants = None
+        self._rbac = None
+        self._plugins = None
+        self._pkg = None
+        self._observe = None
+        self._cloud = None
+        self._compliance = None
+        self._watchdog = None
+
+    @property
+    def tenants(self):
+        """Return a real TenantManager on the test SOS."""
+        if self._tenants is None:
+            from system.enterprise import TenantManager
+            self._tenants = TenantManager(self)
+        return self._tenants
+
+    @property
+    def rbac(self):
+        """Return a real RBAC manager on the test SOS."""
+        if self._rbac is None:
+            from system.enterprise import RBAC
+            self._rbac = RBAC(self.sos)
+        return self._rbac
+
+    @property
+    def plugins(self):
+        """Return a real PluginRegistry on the test SOS."""
+        if self._plugins is None:
+            from plugins.registry import PluginRegistry
+            self._plugins = PluginRegistry(self)
+        return self._plugins
+
+    @property
+    def pkg(self):
+        """Return a real PackageManager on the test SOS."""
+        if self._pkg is None:
+            from system.pkgmgr import PackageManager
+            self._pkg = PackageManager(self.sos)
+        return self._pkg
+
+    @property
+    def observe(self):
+        """Return a real Observability helper."""
+        if self._observe is None:
+            from system.enterprise import Observability
+            self._observe = Observability(self)
+        return self._observe
+
+    @property
+    def cloud(self):
+        """Return cloud manifest generator."""
+        if self._cloud is None:
+            from system.enterprise import CloudManifests
+            self._cloud = CloudManifests()
+        return self._cloud
+
+    @property
+    def compliance(self):
+        """Return a real ComplianceManager."""
+        if self._compliance is None:
+            from system.enterprise import ComplianceManager
+            self._compliance = ComplianceManager(self.sos)
+        return self._compliance
+
+    @property
+    def watchdog(self):
+        """Return a real KernelWatchdog bound to this kernel."""
+        if self._watchdog is None:
+            from kernel.watchdog import KernelWatchdog
+            self._watchdog = KernelWatchdog(self)
+        return self._watchdog
 
     @property
     def tracer(self):
@@ -164,6 +238,17 @@ class _FakeKernel:
 def fake_kernel(sos):
     """Return a lightweight fake kernel wired to the test SOS."""
     return _FakeKernel(sos)
+
+
+@pytest.fixture
+def scheduler():
+    """Return a live AsyncScheduler for kernel tests."""
+    from kernel.scheduler import AsyncScheduler
+
+    sched = AsyncScheduler()
+    sched.start()
+    yield sched
+    sched.stop()
 
 
 # ── Network fixtures ──────────────────────────────────────────────────────────

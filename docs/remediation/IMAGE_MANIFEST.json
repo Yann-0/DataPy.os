@@ -1,0 +1,32 @@
+{
+  "target": "raspberry-pi5-linux-userspace",
+  "certified_hardware_boot": false,
+  "note": "Host-assembled artifact. Hardware/emulator boot is a remaining blocker. Image file is not in git.",
+  "source_at_build": {
+    "commit": "bdea1ad9cb764f815687e9174e6475cbf53e0f3f",
+    "dirty": true,
+    "tree": "81865f199bfda72f2f8769c7954309a773e027bf",
+    "zip_sha256": "b4c78ec22a5674e0c804f5566d268079900999ad98bf016dfe5c767b8e63e14d"
+  },
+  "python": {
+    "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.12.14+20260901-aarch64-unknown-linux-musl-install_only_stripped.tar.gz",
+    "sha256": "a0ad6f01b9204eba573a08927097b78143c564f98bea68a41ea1e172f041da3a"
+  },
+  "musl_loader": {
+    "url": "https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/musl-1.2.5-r3.apk",
+    "sha256": "e455c49c6c3de1dfcd4b9867c35097f588de2fb01a939c77ddb149f8e6086a24"
+  },
+  "partitions": {
+    "1": {"type": "0x0B", "label": "NOVABOOT", "fs": "fat32", "lba_start": 2048},
+    "2": {"type": "0x83", "label": "NOVA_DATA", "fs": "ext4", "lba_start": 526336}
+  },
+  "output": {
+    "local_path": "artifacts/nova_pi5.img",
+    "size": 807403520,
+    "sha256": "622273e1d32fe41c016f2de8e80e7336fa0195df33b2a8fed984c297b7429f34"
+  },
+  "wheel": {
+    "local_path": "dist/datapy_os-0.0.8-py3-none-any.whl",
+    "sha256": "1d225e30e660c1efb8483305919999c1539034d5844ffe9c45b7ba85d242711f"
+  }
+}

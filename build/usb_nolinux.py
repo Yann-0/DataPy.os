@@ -423,8 +423,8 @@ def build(output: Path, size_mb: int = DEFAULT_SIZE_MB) -> Path:
     work = Path(tempfile.mkdtemp(prefix="nova_nolinux_"))
 
     print(f"\n\033[36m╔══════════════════════════════════════════════════════╗\033[0m")
-    print(f"\033[36m║   PyOS NOVA — Pure UEFI USB Builder (No Linux)      ║\033[0m")
-    print(f"\033[36m║   Python runs DIRECTLY under UEFI firmware           ║\033[0m")
+    print(f"\033[36m║   EXPERIMENTAL firmware-native UEFI builder         ║\033[0m")
+    print(f"\033[36m║   Not a supported DataPy.os runtime or working image ║\033[0m")
     print(f"\033[36m╚══════════════════════════════════════════════════════╝\033[0m\n")
     log(f"Output: {output}  Size: {size_mb} MB")
 
@@ -442,23 +442,17 @@ def build(output: Path, size_mb: int = DEFAULT_SIZE_MB) -> Path:
 
         # Final summary
         final_size = output.stat().st_size
-        print(f"\n\033[32m╔══════════════════════════════════════════════════════╗\033[0m")
-        print(f"\033[32m║   Build Complete!                                    ║\033[0m")
-        print(f"\033[32m╠══════════════════════════════════════════════════════╣\033[0m")
-        print(f"\033[32m║\033[0m  Image:       {output.name} ({final_size//MB} MB)")
-        print(f"\033[32m║\033[0m  Bootloader:  EFI/BOOT/BOOTX64.EFI ({efi_bins['bootx64'].stat().st_size} bytes)")
-        print(f"\033[32m║\033[0m  Python EFI:  python/python3.efi ({efi_bins['python3_efi'].stat().st_size//1024} KB)")
-        print(f"\033[32m║\033[0m  No Linux:    ✓  No kernel. No initramfs. Pure Python.")
-        print(f"\033[32m╠══════════════════════════════════════════════════════╣\033[0m")
-        print(f"\033[32m║\033[0m  Write to USB:")
-        print(f"\033[32m║\033[0m    sudo dd if={output.name} of=/dev/sdX bs=4M status=progress && sync")
-        print(f"\033[32m║\033[0m")
-        print(f"\033[32m║\033[0m  Test in QEMU (UEFI, no Linux kernel):")
-        print(f"\033[32m║\033[0m    qemu-system-x86_64 \\")
-        print(f"\033[32m║\033[0m      -bios /usr/share/ovmf/OVMF.fd \\")
-        print(f"\033[32m║\033[0m      -drive file={output.name},format=raw \\")
-        print(f"\033[32m║\033[0m      -m 2G -serial stdio")
-        print(f"\033[32m╚══════════════════════════════════════════════════════╝\033[0m\n")
+        print(f"\n\033[33m╔══════════════════════════════════════════════════════╗\033[0m")
+        print(f"\033[33m║   EXPERIMENTAL artifact assembled                     ║\033[0m")
+        print(f"\033[33m║   Not a supported-release or working-image result     ║\033[0m")
+        print(f"\033[33m╠══════════════════════════════════════════════════════╣\033[0m")
+        print(f"\033[33m║\033[0m  Image:       {output.name} ({final_size//MB} MB)")
+        print(f"\033[33m║\033[0m  Status:      experimental firmware-native research")
+        print(f"\033[33m║\033[0m  Not a Pi 5 Linux userspace or certified working image")
+        print(f"\033[33m╠══════════════════════════════════════════════════════╣\033[0m")
+        print(f"\033[33m║\033[0m  Do not flash without a confirmed target device.")
+        print(f"\033[33m║\033[0m  Do not guess /dev/sdX. This is not a supported release.")
+        print(f"\033[33m╚══════════════════════════════════════════════════════╝\033[0m\n")
 
         return result
 

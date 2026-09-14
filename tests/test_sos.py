@@ -220,7 +220,7 @@ class TestSOSDirectories:
 
     def test_mkdir_and_listdir(self, sos):
         """mkdir creates a directory; listdir returns its contents."""
-        sos.mkdir("/dirs/mydir")
+        sos.mkdir("/dirs/mydir", parents=True)
         sos.write("/dirs/mydir/file1.txt", "a")
         sos.write("/dirs/mydir/file2.txt", "b")
         children = sos.listdir("/dirs/mydir")
@@ -234,7 +234,7 @@ class TestSOSDirectories:
 
     def test_listdir_empty_directory(self, sos):
         """listdir on an empty directory returns an empty list."""
-        sos.mkdir("/dirs/empty")
+        sos.mkdir("/dirs/empty", parents=True)
         assert sos.listdir("/dirs/empty") == []
 
     def test_listdir_nonexistent(self, sos):

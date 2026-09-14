@@ -1,17 +1,44 @@
 .nova/
-*.db *.db-wal *.db-shm
-*.gguf *.bin *.pt *.safetensors
-models/ adapters/ downloads/
+*.db
+*.db-wal
+*.db-shm
+*.gguf
+*.bin
+*.pt
+*.safetensors
+models/
+adapters/
+downloads/
+artifacts/
 **/__pycache__/
-*.pyc *.pyo .pytest_cache/
-.coverage coverage.xml htmlcov/
-.venv/ venv/ .env
-*.img *.iso nova_*.zip
-build/BOOTX64.EFI build/python3.efi build/libpython*
-build/kernel8.img build/initramfs* nova_pi5.img
-dist/ *.egg-info/
-.vscode/ .idea/ *.swp *~ .DS_Store
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.venv/
+venv/
+.env
+*.img
+*.iso
+nova_*.zip
+build/BOOTX64.EFI
+build/python3.efi
+build/libpython*
+build/kernel8.img
+build/initramfs*
+nova_pi5.img
+dist/
+*.egg-info/
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
 .cursor/
+.test-nova-data/
+.pytest-tmp/
 _smoke_*.py
 _count_*.py
-
+build/lib/

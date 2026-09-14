@@ -37,7 +37,9 @@ All subsystems wired together.
 
 import os
 import hashlib
-import os, sys, time, threading
+import os, sys, time, threading, logging
+
+log = logging.getLogger("nova.kernel")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path: sys.path.insert(0, ROOT)
@@ -200,6 +202,12 @@ class NovaKernel:
         self.data       = DataPlane(
             self.sos, self.caps, enforce=False, audit=self.audit
         )
+        self.data.load_policy()
+        self.api_server.dataplane = self.data
+        self.file_server.host = "127.0.0.1"
+        self.file_server.dataplane = self.data
+        if hasattr(self.ai, "bind_store"):
+            self.ai.bind_store(sos=self.sos, dataplane=self.data)
 
         _p("data mgmt")
         # Data management
@@ -334,22 +342,17 @@ class NovaKernel:
             _p(f"seed-early FAILED: {exc}")
 
     def boot(self) -> None:
-        """Start all background services and build the interactive shell.
+        """Start services and build the interactive shell.
 
-        Sequence:
-
-        1. Patch the AI engine with the memory manager (injects remembered
-           context into every LLM call).
-        2. Start the neural search indexer thread.
-        3. Start the proactive health advisor thread.
-        4. Start all four AI agents (sysadmin, coder, researcher, taskmaster).
-        5. Start mDNS peer discovery.
-        6. Register named processes in the process table.
-        7. Instantiate :class:`shell.nova_shell.NovaShell`.
-        8. Load ``~/.nova_rc`` scripting definitions and start the cron
-           scheduler.
+        With ``NOVA_NO_AI=1`` or ``NOVA_LEAN=1``, skip discovery, metrics,
+        agents, advisor, and most SOS monkey-patches — product path is
+        SOS + DataPlane + shell.
         """
         from shell.nova_shell import NovaShell
+
+        lean = os.environ.get("NOVA_NO_AI") == "1" or os.environ.get(
+            "NOVA_LEAN"
+        ) == "1"
 
         def _step(name: str, fn) -> None:
             if os.environ.get("NOVA_BOOT_DEBUG"):
@@ -360,9 +363,9 @@ class NovaKernel:
                 if os.environ.get("NOVA_BOOT_DEBUG"):
                     print(f"[boot] {name} FAILED: {exc}", flush=True)
 
-        # Patch AI with memory context
         _step("ai-memory", lambda: patch_engine_with_memory(self.ai, self.mem))
-        _step("prefetch", lambda: self.prefetch.patch_sos())
+        if not lean:
+            _step("prefetch", lambda: self.prefetch.patch_sos())
         _step("watchdog-reg", lambda: (
             self.watchdog.register(
                 "sos",
@@ -378,51 +381,58 @@ class NovaKernel:
             ),
             self.watchdog.start(),
         ))
-        _step("discovery", lambda: self.discovery.start())
-        _step("metrics", lambda: self.observe.start_metrics_server(9090))
-        _step("health", lambda: self.health.start())
-        # Performance patches
-        _step("waq", lambda: patch_sos_with_waq(self.sos))
-        _step("events", lambda: patch_sos_with_events(self.sos, self.event_bus))
-        _step("compress", lambda: patch_sos_with_compression(self.sos))
-        _step("stream", lambda: setattr(
-            self, "stream", StreamProcessor(self.sos, self.event_bus)))
-        _step("view_mgr", lambda: setattr(
-            self, "view_mgr", ViewManager(self.sos, self.event_bus)))
-        _step("bloom-patch", lambda: self.bloom.patch_sos())
-        _step("schema", lambda: self.schema.patch_sos())
-        _step("kvcache", lambda: patch_ai_with_kvcache(self.ai, self.sos))
-        _step("schema_reg", lambda: self.schema_reg.patch_sos())
-        _step("views-patch", lambda: (
-            self.views.patch_sos() if hasattr(self.views, "patch_sos") else None
-        ))
-        _step("eventsrc", lambda: patch_sos_with_event_sourcing(self.sos, self.es_log))
-        _step("timelock", lambda: self.timelock.patch_sos())
-        _step("classifier", lambda: self.classifier.patch_sos())
-        _step("audit", lambda: patch_sos_with_audit(self.sos, self.audit))
-        _step("lineage", lambda: patch_sos_with_lineage(self.sos, self.lineage))
+        if not lean:
+            _step("discovery", lambda: self.discovery.start())
+            _step("metrics", lambda: self.observe.start_metrics_server(9090))
+            _step("health", lambda: self.health.start())
+            _step("waq", lambda: patch_sos_with_waq(self.sos))
+            _step("events", lambda: patch_sos_with_events(self.sos, self.event_bus))
+            _step("compress", lambda: patch_sos_with_compression(self.sos))
+            _step("stream", lambda: setattr(
+                self, "stream", StreamProcessor(self.sos, self.event_bus)))
+            _step("view_mgr", lambda: setattr(
+                self, "view_mgr", ViewManager(self.sos, self.event_bus)))
+            _step("bloom-patch", lambda: self.bloom.patch_sos())
+            _step("schema", lambda: self.schema.patch_sos())
+            _step("kvcache", lambda: patch_ai_with_kvcache(self.ai, self.sos))
+            _step("schema_reg", lambda: self.schema_reg.patch_sos())
+            _step("views-patch", lambda: (
+                self.views.patch_sos() if hasattr(self.views, "patch_sos") else None
+            ))
+            _step("eventsrc", lambda: patch_sos_with_event_sourcing(self.sos, self.es_log))
+            _step("timelock", lambda: self.timelock.patch_sos())
+            _step("classifier", lambda: self.classifier.patch_sos())
+            _step("audit", lambda: patch_sos_with_audit(self.sos, self.audit))
+            _step("lineage", lambda: patch_sos_with_lineage(self.sos, self.lineage))
+            _step("search", lambda: self.search.start())
+            _step("advisor", lambda: self.advisor.start())
+            _step("agents", lambda: self.agents.start_all())
 
-        # Start background services (best-effort on constrained hosts)
-        _step("search", lambda: self.search.start())
-        _step("advisor", lambda: self.advisor.start())
-        _step("agents", lambda: self.agents.start_all())
-
-        # Register processes
-        for pid, name in [(1,"nova-kernel"),(2,"nova-indexer"),
-                          (3,"nova-advisor"),(4,"nova-agents"),(5,"nova-mdns")]:
+        for pid, name in [(1, "nova-kernel"), (5, "nova-shell")]:
             self.procs.spawn(name, pid=pid, user="root", cmd=f"[{name}]")
+        if not lean:
+            for pid, name in [
+                (2, "nova-indexer"), (3, "nova-advisor"),
+                (4, "nova-agents"), (6, "nova-mdns"),
+            ]:
+                self.procs.spawn(name, pid=pid, user="root", cmd=f"[{name}]")
 
-        # Build shell and load scripting
         _step("shell", lambda: setattr(self, "shell", NovaShell(self)))
         if self.shell:
             self.agent.shell = self.shell
             self.reviewer.advisor = self.advisor
-            _step("rc", lambda: self.scripting.load_rc(self.shell))
-            _step("cron", lambda: self.scripting.start_cron(self.shell))
-        # Core handles seeded in __init__ via raw SOS write (pre-patch).
+            if not lean:
+                _step("rc", lambda: self.scripting.load_rc(self.shell))
+                _step("cron", lambda: self.scripting.start_cron(self.shell))
 
     def shutdown(self) -> None:
         """Flush SOS WAL and stop background services cleanly."""
+        try:
+            if getattr(self, "audit", None) and hasattr(self.audit, "flush"):
+                self.audit.flush()
+        except Exception as exc:
+            log.error("audit flush failed during shutdown: %s", exc)
+            raise
         try:
             if getattr(self, "watchdog", None):
                 self.watchdog.stop()
@@ -453,19 +463,17 @@ class NovaKernel:
         path: Path.
         """
     def sys_read(self, path):
-        """Read via DataPlane handle when possible, else SOS path."""
-        try:
+        """Read via DataPlane. Legacy SOS paths are denied under lockdown."""
+        from store.dataplane import DataPlaneError
+        if "/" not in str(path).lstrip("@"):
             return self.data.get(path).content
-        except Exception:
-            return self.sos.read(path)
-    """Sys write.
+        if self.data.enforce:
+            raise DataPlaneError("legacy path access denied under lockdown")
+        return self.sos.read(path)
 
-        Args:
-        path: Path.
-        c: C.
-        """
     def sys_write(self, path, c, **kw):
-        """Write via DataPlane for flat handles; SOS path otherwise."""
+        """Write via DataPlane. Legacy SOS paths are denied under lockdown."""
+        from store.dataplane import DataPlaneError
         if "/" not in str(path).lstrip("@"):
             rec = self.data.put(path, c, **kw)
             try:
@@ -473,23 +481,19 @@ class NovaKernel:
             except Exception:
                 pass
             return rec.oid
-        oid = self.sos.write(path, c, **kw)
-        try:
-            self.search.index_now(path)
-        except Exception:
-            pass
-        return oid
-    def sys_exec(self, path, args=None):
-        """Sys exec.
+        if self.data.enforce:
+            raise DataPlaneError("legacy path access denied under lockdown")
+        return self.sos.write(path, c, **kw)
 
-            Args:
-            path: Path.
-            args: Args, defaults to None.
-            """
-        try:
-            content = self.data.get(path).content
-        except Exception:
+    def sys_exec(self, path, args=None):
+        """Execute a DataPlane object. Untrusted SOS fallback is not permitted."""
+        from store.dataplane import DataPlaneError
+        if "/" in str(path).lstrip("@"):
+            if self.data.enforce:
+                raise DataPlaneError("legacy path exec denied under lockdown")
             content = self.sos.read(path)
+        else:
+            content = self.data.get(path).content
         ns = {"__name__":"__main__","kernel":self,"sos":self.sos,"data":self.data}
         exec(compile(content, path, "exec"), ns)
     """Sys fork.

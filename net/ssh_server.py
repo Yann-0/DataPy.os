@@ -5,7 +5,7 @@ Accept SSH connections via paramiko.
 Authenticate via ZK credentials or password.
 Each connection gets a full NOVA shell session.
 
-Falls back to plain TCP if paramiko is not installed.
+Missing paramiko is an error. There is no plaintext TCP fallback.
 
 Shell commands:
   sshd [port]    — start SSH server (default 2222)
@@ -48,14 +48,33 @@ class NovaSSHServer:
         """
         if self._has_paramiko():
             return self._start_paramiko()
-        return self._start_tcp_fallback()
+        raise RuntimeError(
+            "SSH dependencies missing (paramiko). Refusing to open an "
+            "unauthenticated plaintext TCP shell."
+        )
+
+    def _host_key_path(self):
+        data = os.environ.get("NOVA_DATA", os.path.expanduser("~/.nova"))
+        certs = os.path.join(data, "certs")
+        os.makedirs(certs, exist_ok=True)
+        return os.path.join(certs, "ssh_host_rsa")
+
+    def _load_host_key(self):
+        import paramiko
+        path = self._host_key_path()
+        if os.path.isfile(path):
+            return paramiko.RSAKey.from_private_key_file(path)
+        key = paramiko.RSAKey.generate(2048)
+        key.write_private_key_file(path)
+        return key
 
     def _start_paramiko(self) -> str:
         """Start paramiko-based SSH server."""
         import paramiko
 
-        host_key = paramiko.RSAKey.generate(2048)
-        kernel   = self.kernel
+        host_key = self._load_host_key()
+        kernel = self.kernel
+        bind_host = os.environ.get("NOVA_SSH_HOST", "127.0.0.1")
 
         class _Interface(paramiko.ServerInterface):
             def check_channel_request(self, kind, chanid):
@@ -74,62 +93,74 @@ class NovaSSHServer:
             def check_channel_shell_request(self, ch): return True
             def check_channel_pty_request(self, ch, *a): return True
 
+        def _read_line(ch) -> str:
+            buf = b""
+            while True:
+                chunk = ch.recv(1)
+                if not chunk or chunk == b"\x04":
+                    raise EOFError
+                if chunk in (b"\r", b"\n"):
+                    ch.send(b"\r\n")
+                    return buf.decode("utf-8", "replace")
+                buf += chunk
+
         def _handle(sock):
+            """Run one SSH session without swapping process-global stdio."""
+            t = None
+            ch = None
             try:
-                import io
                 from shell.nova_shell import NovaShell
                 t = paramiko.Transport(sock)
                 t.add_server_key(host_key)
                 t.start_server(server=_Interface())
                 ch = t.accept(20)
-                if ch is None: return
+                if ch is None:
+                    return
+                username = t.get_username() or "remote"
                 shell = NovaShell(kernel)
-
-                class W:
-                    encoding = "utf-8"
-                    def write(self, s):
-                        try: ch.send(s.encode("utf-8","replace"))
-                        except: pass
-                    def flush(self): pass
-                    def fileno(self): raise io.UnsupportedOperation
-                    def isatty(self): return True
-
-                import builtins
-                old = builtins.input
-                def _inp(p=""):
-                    ch.send(p.encode())
-                    buf = b""
-                    while True:
-                        c = ch.recv(1)
-                        if not c or c == b"\x04": raise EOFError
-                        if c in (b"\r", b"\n"):
-                            ch.send(b"\r\n")
-                            return buf.decode("utf-8","replace")
-                        elif c == b"\x7f":
-                            if buf: buf = buf[:-1]; ch.send(b"\x08 \x08")
-                        else:
-                            buf += c; ch.send(c)
-
-                builtins.input = _inp
-                old_o, old_e = sys.stdout, sys.stderr
-                sys.stdout = sys.stderr = W()
-                try: shell.run()
-                finally:
-                    builtins.input = old
-                    sys.stdout, sys.stderr = old_o, old_e
-                    ch.close()
-            except Exception: pass
+                shell.user = username
+                ch.send(b"datapy ssh (per-session execute, no global stdio)\r\n")
+                while True:
+                    ch.send(b"$ ")
+                    line = _read_line(ch).strip()
+                    if not line:
+                        continue
+                    if line in {"exit", "quit"}:
+                        break
+                    result = shell.execute(line)
+                    msg = (
+                        f"ok {line}\r\n" if result.ok
+                        else f"error {result.error or line}\r\n"
+                    )
+                    ch.send(msg.encode("utf-8", "replace"))
+            except Exception:
+                pass
+            finally:
+                if ch is not None:
+                    try:
+                        ch.close()
+                    except Exception:
+                        pass
+                if t is not None:
+                    try:
+                        t.close()
+                    except Exception:
+                        pass
 
         def _loop():
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("0.0.0.0", self.port))
-            s.listen(5); s.settimeout(1.0)
+            s.bind((bind_host, self.port))
+            s.listen(5)
+            s.settimeout(1.0)
             while self._running:
                 try:
-                    c, _ = s.accept()
-                    threading.Thread(target=_handle, args=(c,), daemon=True).start()
-                except: pass
+                    client, _ = s.accept()
+                    threading.Thread(
+                        target=_handle, args=(client,), daemon=True
+                    ).start()
+                except OSError:
+                    continue
             s.close()
 
         self._running = True
@@ -137,36 +168,10 @@ class NovaSSHServer:
         return f"SSH listening on port {self.port} (paramiko)"
 
     def _start_tcp_fallback(self) -> str:
-        """Start plain TCP shell fallback."""
-        kernel = self.kernel
-
-        def _handle(conn):
-            try:
-                import io
-                from shell.nova_shell import NovaShell
-                shell = NovaShell(kernel)
-                f = conn.makefile("rw", encoding="utf-8", errors="replace", newline="")
-                import builtins
-                builtins.input = lambda p="": (f.write(p) or f.readline().rstrip("\n"))
-                sys.stdout = sys.stderr = f
-                try: shell.run()
-                finally: f.close(); conn.close()
-            except Exception: pass
-
-        def _loop():
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("0.0.0.0", self.port)); s.listen(5); s.settimeout(1.0)
-            while self._running:
-                try:
-                    c, _ = s.accept()
-                    threading.Thread(target=_handle, args=(c,), daemon=True).start()
-                except: pass
-            s.close()
-
-        self._running = True
-        threading.Thread(target=_loop, daemon=True, name="nova-sshd").start()
-        return f"TCP shell on port {self.port} (install paramiko for SSH)"
+        """Plaintext fallback is never started."""
+        raise RuntimeError(
+            "unauthenticated plaintext TCP shell is not a supported fallback"
+        )
 
     def stop(self):
         """Stop the SSH server."""

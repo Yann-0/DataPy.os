@@ -1,26 +1,15 @@
 """
-PyOS NOVA — Raspberry Pi 5 Complete Image Builder
-===================================================
-Run this script on Windows (Python 3.9+), Linux, or macOS.
-It downloads everything needed and builds a complete bootable USB image.
+DataPy.os — Raspberry Pi 5 image builder (Linux userspace / PID-1)
+===================================================================
+Builds an MBR disk image: FAT32 boot + labelled ext4 NOVA_DATA.
 
-  python build_pi5_nova.py
+This is a host-side assembler. It does not certify a Pi 5 boot. Firmware-
+native UEFI is a different, experimental path.
 
-Output: nova_pi5.img  (~300 MB)
-Flash:  Use Rufus (Windows) → Select nova_pi5.img → DD Image mode → Flash
+  python build/build_pi5_nova.py --output artifacts/nova_pi5.img
 
-What gets downloaded (~37 MB total):
-  Pi 5 firmware files  (~3 MB)   from github.com/raspberrypi/firmware
-  Linux kernel Pi 5    (~31 MB)  from github.com/raspberrypi/firmware
-  Python 3.12 ARM64    (~34 MB)  from github.com/indygreg/python-build-standalone
-
-What you get:
-  - Boots directly on Pi 5 from USB
-  - NO Raspberry Pi OS, NO Debian, NO apt-get, NO bash
-  - Python 3.12 IS the operating system (PID-1)
-  - Full PyOS NOVA shell with 104 commands
-  - Persistent storage on USB second partition
-  - Works on Pi 5 4GB / 8GB
+Do not flash without an explicitly confirmed target. Do not guess /dev/sdX.
+Do not overwrite an existing NOVA_DATA partition when replacing boot files.
 """
 
 from __future__ import annotations
@@ -37,6 +26,7 @@ import urllib.request
 import urllib.error
 import time
 import argparse
+import json
 from pathlib import Path
 
 
@@ -64,12 +54,22 @@ PI_FIRMWARE_FILES = {
     "kernel_2712.img":       "Pi 5 optimised Linux kernel (~31 MB)",
 }
 
-# Static Python 3.12 ARM64 (no shared library dependencies)
+# Python 3.12.14 ARM64 musl (needs /lib/ld-musl-aarch64.so.1 in initramfs)
 PYTHON_ARM64_URL = (
-    "https://github.com/indygreg/python-build-standalone/releases/download"
-    "/20241016/cpython-3.12.7+20241016-aarch64-unknown-linux-gnu-install_only.tar.gz"
+    "https://github.com/astral-sh/python-build-standalone/releases/download"
+    "/20260901/cpython-3.12.14+20260901-aarch64-unknown-linux-musl"
+    "-install_only_stripped.tar.gz"
 )
-PYTHON_ARM64_SHA256 = None  # set to actual hash once known; None = skip verify
+PYTHON_ARM64_SHA256 = (
+    "a0ad6f01b9204eba573a08927097b78143c564f98bea68a41ea1e172f041da3a"
+)
+MUSL_LOADER_URL = (
+    "https://dl-cdn.alpinelinux.org/alpine/v3.20/main/aarch64/musl-1.2.5-r3.apk"
+)
+MUSL_LOADER_SHA256 = (
+    "e455c49c6c3de1dfcd4b9867c35097f588de2fb01a939c77ddb149f8e6086a24"
+)
+MUSL_LOADER_NAME = "ld-musl-aarch64.so.1"
 
 # ─── Colours ──────────────────────────────────────────────────────────────────
 
@@ -80,15 +80,16 @@ RED    = "\033[31m"
 RESET  = "\033[0m"
 BOLD   = "\033[1m"
 
-def ok(msg):  print(f"{GREEN}  ✓{RESET} {msg}")
-def log(msg): print(f"{CYAN}  →{RESET} {msg}")
-def warn(msg):print(f"{YELLOW}  ⚠{RESET} {msg}")
-def err(msg): print(f"{RED}  ✗{RESET} {msg}"); sys.exit(1)
+def ok(msg):  print(f"{GREEN}  [ok]{RESET} {msg}")
+def log(msg): print(f"{CYAN}  ->{RESET} {msg}")
+def warn(msg):print(f"{YELLOW}  [warn]{RESET} {msg}")
+def err(msg): print(f"{RED}  [fail]{RESET} {msg}"); sys.exit(1)
 
 
 # ─── Downloader ───────────────────────────────────────────────────────────────
 
-def download(url: str, dest: Path, desc: str = "") -> Path:
+def download(url: str, dest: Path, desc: str = "",
+             sha256: str | None = None) -> Path:
     """
     Download a file with a progress bar.
 
@@ -102,8 +103,16 @@ def download(url: str, dest: Path, desc: str = "") -> Path:
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and dest.stat().st_size > 0:
-        ok(f"Already downloaded: {dest.name}")
-        return dest
+        if sha256:
+            digest = hashlib.sha256(dest.read_bytes()).hexdigest()
+            if digest.lower() != sha256.lower():
+                dest.unlink()
+            else:
+                ok(f"Already downloaded: {dest.name}")
+                return dest
+        else:
+            ok(f"Already downloaded: {dest.name}")
+            return dest
 
     label = desc or dest.name
     print(f"  ↓ {label}", end="", flush=True)
@@ -132,8 +141,14 @@ def download(url: str, dest: Path, desc: str = "") -> Path:
 
             tmp.rename(dest)
 
+        if sha256:
+            digest = hashlib.sha256(dest.read_bytes()).hexdigest()
+            if digest.lower() != sha256.lower():
+                dest.unlink(missing_ok=True)
+                err(f"SHA-256 mismatch for {dest.name}: {digest}")
+
         size_mb = dest.stat().st_size // MB
-        print(f"\r  ✓ {label}: {size_mb} MB            ")
+        print(f"\r  [ok] {label}: {size_mb} MB            ")
         return dest
 
     except urllib.error.HTTPError as e:
@@ -143,6 +158,72 @@ def download(url: str, dest: Path, desc: str = "") -> Path:
     except Exception as e:
         print()
         err(f"Download failed: {e}")
+
+
+def pack_current_source(dest: Path) -> tuple[Path, dict]:
+    """Zip the current checkout and record commit / dirty state."""
+    import zipfile
+    import subprocess as sp
+
+    root = SCRIPT_DIR.parent
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    meta = {"commit": "unknown", "dirty": True, "tree": "unknown"}
+    try:
+        commit = sp.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True
+        ).strip()
+        tree = sp.check_output(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=root, text=True
+        ).strip()
+        dirty = bool(sp.check_output(
+            ["git", "status", "--porcelain"], cwd=root, text=True
+        ).strip())
+        meta = {"commit": commit, "dirty": dirty, "tree": tree}
+    except Exception as exc:
+        log(f"git identity unavailable: {exc}")
+    skip = {".git", ".venv", "__pycache__", ".pytest_cache", "downloads",
+            "dist", ".test-nova-data", "artifacts", ".pytest-tmp"}
+    with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in root.rglob("*"):
+            if any(part in skip for part in path.parts):
+                continue
+            if path.is_file() and path.suffix not in {".img", ".gguf"}:
+                zf.write(path, "nova/" + str(path.relative_to(root)).replace("\\", "/"))
+        zf.writestr("nova/SOURCE_IDENTITY.json",
+                    __import__("json").dumps(meta, indent=2))
+    meta["zip_sha256"] = hashlib.sha256(dest.read_bytes()).hexdigest()
+    return dest, meta
+
+
+def python_prefix(python_dir: Path) -> Path:
+    """Normalize python-build-standalone layouts to the install prefix."""
+    if (python_dir / "bin" / "python3").exists():
+        return python_dir
+    nested = python_dir / "python"
+    if (nested / "bin" / "python3").exists() or (nested / "bin" / "python3.12").exists():
+        return nested
+    return python_dir
+
+
+def extract_musl_loader(apk: Path, dest: Path) -> Path:
+    """Extract ld-musl-aarch64.so.1 from an Alpine musl APK."""
+    import gzip
+    import io
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    raw = gzip.GzipFile(fileobj=io.BytesIO(apk.read_bytes()))
+    with tarfile.open(fileobj=raw) as tar:
+        for member in tar.getmembers():
+            if not member.isfile():
+                continue
+            if MUSL_LOADER_NAME not in member.name:
+                continue
+            extracted = tar.extractfile(member)
+            if extracted is None:
+                continue
+            dest.write_bytes(extracted.read())
+            return dest
+    err(f"{MUSL_LOADER_NAME} not found in {apk.name}")
+    return dest
 
 
 # ─── Pi boot configuration ────────────────────────────────────────────────────
@@ -241,13 +322,22 @@ def log(msg: str, level: str = "INFO") -> None:
 
 
 def mount(src: str, dst: str, fstype: str, opts: str = "") -> None:
-    """Mount a filesystem, creating the mountpoint if needed."""
+    """Mount via Linux syscall, else the mount utility with inherited streams."""
     os.makedirs(dst, exist_ok=True)
+    try:
+        sys.path.insert(0, "/nova")
+        from boot.linux import linux_mount
+        linux_mount(src, dst, fstype, opts)
+        return
+    except Exception:
+        pass
     cmd = ["mount", "-t", fstype]
     if opts:
         cmd += ["-o", opts]
     cmd += [src, dst]
-    subprocess.run(cmd, stderr=subprocess.DEVNULL)
+    # Inherit the console: /dev/null may not exist until devtmpfs is mounted.
+    # Essential mount failures must stop boot instead of reporting success.
+    subprocess.run(cmd, check=True)
 
 
 def setup_filesystems() -> None:
@@ -262,45 +352,25 @@ def setup_filesystems() -> None:
     log("Virtual filesystems ready", "OK")
 
 
-def mount_data_partition() -> str | None:
-    """
-    Find and mount the NOVA data partition (second partition on the USB drive).
+def mount_data_partition() -> str:
+    """Mount the labelled NOVA_DATA filesystem or fail if persistence is required."""
+    sys.path.insert(0, "/nova")
+    from boot.linux import BootstrapError, mount_persistent_data, reap_zombies
 
-    The data partition stores the SOS SQLite database so user data survives
-    reboots. Without it, NOVA still works but nothing is saved.
-
-    Returns the mountpoint path, or None if not found.
-    """
-    # Try partition label first (most reliable)
+    require = os.environ.get("NOVA_REQUIRE_PERSISTENCE", "1") != "0"
+    volatile_ok = os.environ.get("NOVA_VOLATILE_OK", "0") == "1"
     try:
-        result = subprocess.run(
-            ["blkid", "-o", "device", "-t", "LABEL=NOVA_DATA"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.stdout.strip():
-            dev = result.stdout.strip().split("\\n")[0]
-            mnt = "/mnt/nova_data"
-            os.makedirs(mnt, exist_ok=True)
-            r = subprocess.run(["mount", dev, mnt],
-                               capture_output=True, timeout=5)
-            if r.returncode == 0:
-                log(f"Data partition {{dev}} mounted at {{mnt}}", "OK")
-                return mnt
-    except Exception:
-        pass
-
-    # Fallback: scan common USB partition paths
-    for dev in ["/dev/sda2", "/dev/sdb2", "/dev/mmcblk0p2"]:
-        if os.path.exists(dev):
-            mnt = "/mnt/nova_data"
-            os.makedirs(mnt, exist_ok=True)
-            if subprocess.run(["mount", dev, mnt],
-                               capture_output=True).returncode == 0:
-                log(f"Data partition {{dev}} mounted at {{mnt}}", "OK")
-                return mnt
-
-    log("No data partition found — using RAM (data not persistent)", "WARN")
-    return None
+        mnt = mount_persistent_data(require=require, volatile_ok=volatile_ok)
+    except BootstrapError as exc:
+        log(str(exc), "ERR")
+        raise
+    if mnt.endswith("volatile"):
+        log("VOLATILE MODE: writes will not survive reboot", "ERR")
+        os.environ["NOVA_PERSISTENCE"] = "volatile"
+    else:
+        os.environ["NOVA_PERSISTENCE"] = "durable"
+        log(f"Persistent data at {{mnt}}", "OK")
+    return mnt
 
 
 def print_banner() -> None:
@@ -349,7 +419,7 @@ def boot() -> int:
 
     # 4. Mount persistent data partition
     data_mnt = mount_data_partition()
-    nova_data = data_mnt or "/tmp/nova_data"
+    nova_data = data_mnt
     os.makedirs(nova_data, exist_ok=True)
     os.environ["NOVA_DATA"] = nova_data
 
@@ -381,11 +451,17 @@ def boot() -> int:
         return 1
 
 
-# ── PID-1 signal handling ─────────────────────────────────────────────────────
+def _reap(_signum=None, frame=None):
+    try:
+        from boot.linux import reap_zombies
+        reap_zombies()
+    except Exception:
+        pass
+
 # PID-1 must not die — the kernel panics if init exits.
-signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-signal.signal(signal.SIGINT,  lambda *_: None)     # Ctrl-C ignored in PID-1
-signal.signal(signal.SIGCHLD, signal.SIG_DFL)      # reap zombie children
+signal.signal(signal.SIGTERM, lambda *_: None)
+signal.signal(signal.SIGINT,  lambda *_: None)
+signal.signal(signal.SIGCHLD, _reap)
 
 if __name__ == "__main__":
     try:
@@ -436,31 +512,37 @@ class CPIOWriter:
         self._ino = 1
 
     def add_dir(self, path: str, mode: int = 0o040755):
-        self._entries.append((path.lstrip("/"), b"", mode))
+        self._entries.append((path.lstrip("/"), b"", mode, 0, 0))
 
     def add_file(self, path: str, data: bytes, mode: int = 0o100644):
-        self._entries.append((path.lstrip("/"), data, mode))
+        self._entries.append((path.lstrip("/"), data, mode, 0, 0))
 
     def add_symlink(self, path: str, target: str):
-        self._entries.append((path.lstrip("/"), target.encode(), 0o120777))
+        self._entries.append((path.lstrip("/"), target.encode(), 0o120777, 0, 0))
+
+    def add_device(self, path: str, major: int, minor: int,
+                   permissions: int = 0o600) -> None:
+        """Encode a character device without requiring host mknod privileges."""
+        self._entries.append((path.lstrip("/"), b"", 0o020000 | permissions, major, minor))
 
     def add_file_from_disk(self, cpio_path: str, disk_path: Path, mode: int = 0o100644):
         self.add_file(cpio_path, disk_path.read_bytes(), mode)
 
-    def _header(self, name: str, data: bytes, mode: int) -> bytes:
+    def _header(self, name: str, data: bytes, mode: int,
+                rdevmajor: int = 0, rdevminor: int = 0) -> bytes:
         nb = name.encode() + b"\x00"
         nl, dl = len(nb), len(data)
         self._ino += 1
         h8 = lambda n: f"{n:08x}".encode()
         hdr = (self.MAGIC + h8(self._ino) + h8(mode) + h8(0) + h8(0)
                + h8(1) + h8(int(time.time())) + h8(dl)
-               + h8(0) + h8(0) + h8(0) + h8(0) + h8(nl) + h8(0))
+               + h8(0) + h8(0) + h8(rdevmajor) + h8(rdevminor) + h8(nl) + h8(0))
         np = (4 - (110 + nl) % 4) % 4
         dp = (4 - dl % 4) % 4
         return hdr + nb + b"\x00" * np + data + b"\x00" * dp
 
     def build(self) -> bytes:
-        parts = [self._header(p, d, m) for p, d, m in self._entries]
+        parts = [self._header(*entry) for entry in self._entries]
         parts.append(self._header("TRAILER!!!", b"", 0))
         return b"".join(parts)
 
@@ -468,7 +550,7 @@ class CPIOWriter:
 # ─── Initramfs builder ────────────────────────────────────────────────────────
 
 def build_initramfs(python_dir: Path, nova_source_zip: Path,
-                     output: Path) -> int:
+                     output: Path, musl_loader: Path | None = None) -> int:
     """
     Build the initramfs containing Python 3.12 ARM64 + PyOS NOVA.
 
@@ -476,11 +558,13 @@ def build_initramfs(python_dir: Path, nova_source_zip: Path,
         python_dir:      Extracted Python ARM64 directory.
         nova_source_zip: Zip containing NOVA Python source.
         output:          Output path for initramfs_nova.gz.
+        musl_loader:     Optional ld-musl-aarch64.so.1 for musl Python.
 
     Returns:
         Size of the compressed initramfs in bytes.
     """
     log("Building initramfs (Python ARM64 + NOVA source)...")
+    python_dir = python_prefix(python_dir)
     cpio = CPIOWriter()
 
     # Standard directory hierarchy
@@ -528,11 +612,21 @@ def build_initramfs(python_dir: Path, nova_source_zip: Path,
         if any(p in ("test", "tests", "__pycache__", "idle_test") for p in parts):
             continue
         rel = lib_path.relative_to(python_dir)
-        cpio.add_dir("/".join(["usr/local"] + list(rel.parts[:-1])))
-        cpio.add_file(f"usr/local/{rel}", lib_path.read_bytes())
+        rel_s = str(rel).replace("\\", "/")
+        if rel_s.startswith("python/"):
+            rel_s = rel_s[len("python/"):]
+        dest_dir = "/".join(["usr/local"] + rel_s.split("/")[:-1])
+        cpio.add_dir(dest_dir)
+        cpio.add_file(f"usr/local/{rel_s}", lib_path.read_bytes())
         py_lib_count += 1
 
     ok(f"  Python stdlib: {py_lib_count} files")
+
+    if musl_loader and Path(musl_loader).is_file():
+        data = Path(musl_loader).read_bytes()
+        cpio.add_file(f"lib/{MUSL_LOADER_NAME}", data, 0o100755)
+        cpio.add_symlink(f"lib64/{MUSL_LOADER_NAME}", f"/lib/{MUSL_LOADER_NAME}")
+        ok(f"  musl loader: {MUSL_LOADER_NAME}")
 
     # ── Shared libraries Python needs ──────────────────────────────────────────
     # python-build-standalone bundles libpython statically, but we may need
@@ -596,7 +690,8 @@ def build_initramfs(python_dir: Path, nova_source_zip: Path,
     cpio.add_file("etc/fstab",
         b"# PyOS NOVA fstab\ntmpfs /tmp tmpfs defaults 0 0\n")
     # /dev/console must exist before devtmpfs is mounted
-    cpio.add_file("dev/console", b"", 0o20600)
+    cpio.add_device("dev/console", 5, 1, permissions=0o600)
+    cpio.add_device("dev/null", 1, 3, permissions=0o666)
     # ld cache
     cpio.add_file("etc/ld.so.conf",
         b"/usr/local/lib\n/usr/local/lib/python3.12/lib-dynload\n")
@@ -836,27 +931,20 @@ def build_disk_image(output: Path, boot_files: dict, total_mb: int) -> Path:
 
     # ── FAT32 boot partition ──────────────────────────────────────────────────
     log("Building FAT32 boot partition...")
-    fat_path = output.with_suffix(".fat32.tmp")
-    fat_data = build_fat32_image(BOOT_MB, "NOVABOOT")
-    fat_path.write_bytes(fat_data)
+    from build.fat32 import Fat32Error, build_fat32_files
 
-    # Populate files — try mtools first, then fallback
-    if not populate_fat32_with_mtools(fat_path, boot_files):
-        warn("mtools not available — using direct FAT32 write (basic)")
-        fat_data = bytearray(fat_path.read_bytes())
-        # Write files using our minimal FAT32 writer
-        for fname, content in boot_files.items():
-            if isinstance(content, Path):
-                content = content.read_bytes()
-            elif isinstance(content, str):
-                content = content.encode()
-            short_name = Path(fname).name
-            write_file_to_fat32(fat_data, short_name, content)
-        fat_path.write_bytes(fat_data)
-        warn("For a fully bootable image, install mtools: sudo apt install mtools")
-
-    fat_bytes = fat_path.read_bytes()
-    fat_path.unlink(missing_ok=True)
+    payload: dict[str, bytes] = {}
+    for fname, content in boot_files.items():
+        if isinstance(content, Path):
+            content = content.read_bytes()
+        elif isinstance(content, str):
+            content = content.encode()
+        payload["/" + str(fname).lstrip("/")] = content
+    try:
+        fat_bytes = build_fat32_files(BOOT_MB * MB, payload, label="NOVABOOT")
+    except Fat32Error as exc:
+        err(f"FAT32 write/readback failed: {exc}")
+        raise
 
     # ── Assemble disk image ───────────────────────────────────────────────────
     log(f"Assembling {total_mb} MB disk image...")
@@ -873,8 +961,49 @@ def build_disk_image(output: Path, boot_files: dict, total_mb: int) -> Path:
         f.seek(boot_start_lba * 512)
         f.write(fat_bytes[:BOOT_MB * MB])
 
+    # Format the persistent ext4 filesystem inside the image file (not a device).
+    from build.persist_fs import format_ext4_file, write_partition_slice
+    fs_tmp = output.with_suffix(".ext4.tmp")
+    format_ext4_file(fs_tmp, DATA_MB * MB, label="NOVA_DATA")
+    write_partition_slice(output, data_start_lba * 512, DATA_MB * MB, fs_tmp)
+    fs_tmp.unlink(missing_ok=True)
+    ok("NOVA_DATA ext4 filesystem written into partition 2")
+
     ok(f"Disk image: {output.stat().st_size // MB} MB")
     return output
+
+
+def write_build_manifest(output: Path, source_meta: dict,
+                          cache_dir: Path, extra: dict | None = None) -> Path:
+    """Write a source/checksum manifest next to the image (not in git)."""
+    manifest = {
+        "target": "raspberry-pi5-linux-userspace",
+        "certified_hardware_boot": False,
+        "source": source_meta,
+        "python": {
+            "url": PYTHON_ARM64_URL,
+            "sha256": PYTHON_ARM64_SHA256,
+        },
+        "musl_loader": {
+            "url": MUSL_LOADER_URL,
+            "sha256": MUSL_LOADER_SHA256,
+        },
+        "partitions": {
+            "1": {"type": "0x0B", "label": "NOVABOOT", "fs": "fat32"},
+            "2": {"type": "0x83", "label": "NOVA_DATA", "fs": "ext4"},
+        },
+        "output": {
+            "path": str(output),
+            "size": output.stat().st_size,
+            "sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+        },
+        "cache": str(cache_dir),
+    }
+    if extra:
+        manifest.update(extra)
+    dest = output.with_suffix(output.suffix + ".manifest.json")
+    dest.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return dest
 
 
 def _mbr_entry(bootable: bool, part_type: int,
@@ -899,15 +1028,9 @@ def main() -> int:
         description="Build a bootable PyOS NOVA USB image for Raspberry Pi 5",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-After building:
-  Flash with Rufus (Windows):
-    rufus.ie → Select nova_pi5.img → DD Image mode → Start
-
-  Flash with dd (Linux/Mac):
-    sudo dd if=nova_pi5.img of=/dev/sdX bs=4M status=progress && sync
-
-  Flash with balenaEtcher (any platform):
-    etcher.balena.io → Flash from file → Select → Flash
+After building, keep the image out of git. Hardware flashing requires an
+explicitly confirmed target. Do not guess /dev/sdX. Preserve an existing
+NOVA_DATA partition when replacing boot artifacts.
         """,
     )
     parser.add_argument("--output", "-o", default="nova_pi5.img",
@@ -937,29 +1060,18 @@ After building:
     print(f"  Size:     {total_mb} MB  ({BOOT_MB} MB boot + {DATA_MB} MB data)")
     print(f"  Cache:    {cache_dir}\n")
 
-    # ── Step 1: Find NOVA source zip ──────────────────────────────────────────
+    # ── Step 1: Pack current source ──────────────────────────────────────────────
     nova_zip = None
+    source_meta = {}
     if args.nova_zip:
         nova_zip = Path(args.nova_zip)
+        if not nova_zip.exists():
+            err(f"--nova-zip not found: {nova_zip}")
+        source_meta["zip_sha256"] = hashlib.sha256(nova_zip.read_bytes()).hexdigest()
+        source_meta["note"] = "explicit zip input; hash recorded"
     else:
-        # Look in common locations
-        candidates = [
-            SCRIPT_DIR / "nova_github_ready.zip",
-            SCRIPT_DIR.parent / "nova_github_ready.zip",
-            Path("nova_github_ready.zip"),
-            SCRIPT_DIR / "nova_rpi5_overlay.zip",
-        ]
-        for c in candidates:
-            if c.exists():
-                nova_zip = c
-                break
-
-    if nova_zip is None or not nova_zip.exists():
-        print(f"{YELLOW}  ⚠  NOVA source zip not found.{RESET}")
-        print(f"     Download nova_github_ready.zip and put it beside this script.")
-        print(f"     Or specify: --nova-zip /path/to/nova_github_ready.zip")
-        return 1
-    ok(f"NOVA source: {nova_zip.name}")
+        nova_zip, source_meta = pack_current_source(cache_dir / "datapy_source.zip")
+    ok(f"NOVA source: {nova_zip.name} commit={source_meta.get('commit','?')}")
 
     # ── Step 2: Download Pi firmware ──────────────────────────────────────────
     print(f"\n{BOLD}Step 1/4: Downloading Raspberry Pi 5 firmware{RESET}")
@@ -973,7 +1085,11 @@ After building:
     # ── Step 3: Download Python ARM64 ─────────────────────────────────────────
     print(f"\n{BOLD}Step 2/4: Downloading Python 3.12 ARM64 (static){RESET}")
     py_archive = cache_dir / "python_arm64.tar.gz"
-    download(PYTHON_ARM64_URL, py_archive, "Python 3.12.7 ARM64 static build")
+    download(PYTHON_ARM64_URL, py_archive, "Python 3.12.14 ARM64 musl",
+             sha256=PYTHON_ARM64_SHA256)
+    musl_apk = cache_dir / "musl-1.2.5-r3.apk"
+    download(MUSL_LOADER_URL, musl_apk, "Alpine musl aarch64",
+             sha256=MUSL_LOADER_SHA256)
 
     # Extract Python
     py_dir = cache_dir / "python_arm64"
@@ -992,7 +1108,8 @@ After building:
     initrd_path = cache_dir / "initramfs_nova.gz"
     if initrd_path.exists():
         initrd_path.unlink()  # always rebuild fresh
-    build_initramfs(py_dir, nova_zip, initrd_path)
+    musl_loader = extract_musl_loader(musl_apk, cache_dir / "musl_aarch64" / MUSL_LOADER_NAME)
+    build_initramfs(py_dir, nova_zip, initrd_path, musl_loader=musl_loader)
 
     # ── Step 5: Assemble disk image ────────────────────────────────────────────
     print(f"\n{BOLD}Step 4/4: Assembling bootable disk image{RESET}")
@@ -1006,23 +1123,16 @@ After building:
     }
 
     build_disk_image(output, boot_files, total_mb)
+    manifest = write_build_manifest(output, source_meta, cache_dir)
+    ok(f"Manifest: {manifest}")
 
     # ── Done ───────────────────────────────────────────────────────────────────
     final_mb = output.stat().st_size // MB
-    print(f"\n{GREEN}{BOLD}╔══════════════════════════════════════════════════════════╗{RESET}")
-    print(f"{GREEN}{BOLD}║   PyOS NOVA Pi 5 Image Built Successfully!                ║{RESET}")
-    print(f"{GREEN}{BOLD}╠══════════════════════════════════════════════════════════╣{RESET}")
-    print(f"{GREEN}║{RESET}  Image:     {output.name} ({final_mb} MB)")
-    print(f"{GREEN}║{RESET}  Boot:      Python 3.12 ARM64 is PID-1 (no Raspberry Pi OS)")
-    print(f"{GREEN}║{RESET}  Kernel:    Pi 5 kernel_2712.img + Python-only initramfs")
-    print(f"{GREEN}║{RESET}  NOVA:      Full PyOS NOVA shell with 104 commands")
-    print(f"{GREEN}╠══════════════════════════════════════════════════════════╣{RESET}")
-    print(f"{GREEN}║{RESET}  {YELLOW}Flash to USB (Windows — Rufus):{RESET}")
-    print(f"{GREEN}║{RESET}    rufus.ie → {output.name} → DD Image mode → Start")
-    print(f"{GREEN}║{RESET}")
-    print(f"{GREEN}║{RESET}  {YELLOW}Flash to USB (Linux/Mac):{RESET}")
-    print(f"{GREEN}║{RESET}    sudo dd if={output.name} of=/dev/sdX bs=4M status=progress")
-    print(f"{GREEN}╚══════════════════════════════════════════════════════════╝{RESET}\n")
+    print(f"\n{CYAN}{BOLD}Image assembled (host build). Pi 5 hardware boot is NOT certified.{RESET}")
+    print(f"  Image: {output} ({final_mb} MB)")
+    print(f"  Persistence: ext4 labelled NOVA_DATA in partition 2")
+    print(f"  Do not flash without an explicitly confirmed target device.")
+    print(f"  Do not guess /dev/sdX. Preserve an existing data partition.\n")
     return 0
 
 

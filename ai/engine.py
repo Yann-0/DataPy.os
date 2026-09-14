@@ -301,139 +301,221 @@ OS_KB = {
 }
 
 class RAGEngine:
-    """R a g engine."""
+    """Retrieval over SOS (and a small static OS_KB fallback)."""
+
+    def __init__(self, sos=None, dataplane=None):
+        """Optional SOS / DataPlane for live retrieval."""
+        self.sos = sos
+        self.dataplane = dataplane
+
+    def bind(self, sos=None, dataplane=None) -> None:
+        """Attach store surfaces after kernel construction."""
+        if sos is not None:
+            self.sos = sos
+        if dataplane is not None:
+            self.dataplane = dataplane
+
     def complete(self, prompt, system="", **kw):
-        """Complete.
-
-            Args:
-            prompt: Prompt.
-            system: System, defaults to ''.
-            """
+        """Stream a single answer string."""
         yield self._answer(prompt)
-    def _answer(self, q):
-        """Answer.
 
-            Args:
-            q: Q.
-            """
+    def _sos_hits(self, q: str, limit: int = 5) -> list:
+        snippets = []
+        words = [w for w in q.lower().split() if len(w) > 2]
+        if self.dataplane is not None:
+            try:
+                cards = list(self.dataplane.find(query=q, limit=limit))
+                if not cards and words:
+                    # Also match handle / tag names (not only FTS body).
+                    seen = set()
+                    for card in self.dataplane.find(limit=80):
+                        handle = str(card.get("handle", "")).lower()
+                        tags = " ".join(card.get("tags") or []).lower()
+                        blob = f"{handle} {tags}"
+                        if any(w in blob for w in words):
+                            if handle in seen:
+                                continue
+                            seen.add(handle)
+                            cards.append(card)
+                        if len(cards) >= limit:
+                            break
+                for card in cards[:limit]:
+                    handle = card.get("handle", "?")
+                    try:
+                        body = self.dataplane.get(handle).content
+                    except Exception:
+                        body = ""
+                    preview = " ".join(str(body).split())[:240]
+                    snippets.append(f"@{handle}: {preview}")
+                if snippets:
+                    return snippets
+            except Exception:
+                pass
+        if self.sos is not None:
+            try:
+                for hit in self.sos.keyword_search(q, limit=limit):
+                    p = hit.get("path", hit.get("oid", "?"))
+                    snip = hit.get("snippet") or ""
+                    snippets.append(f"{p}: {snip}"[:280])
+            except Exception:
+                pass
+        return snippets
+
+    def _answer(self, q):
+        """Answer from SOS first, then static OS_KB."""
         ql = q.lower()
+        hits = self._sos_hits(q)
+        if hits:
+            return (
+                "From DataPy SOS:\n"
+                + "\n".join(f"- {h}" for h in hits)
+                + "\n(Use `data get <handle>` for full content.)"
+            )
         best, ans = 0, None
         for key, text in OS_KB.items():
             kw = set(key.split())
-            s  = sum(1 for w in kw if w in ql) / max(len(kw),1)
-            if s > best: best, ans = s, text
-        if ans and best > 0.2: return ans
+            s = sum(1 for w in kw if w in ql) / max(len(kw), 1)
+            if s > best:
+                best, ans = s, text
+        if ans and best > 0.2:
+            return ans
         for key, text in OS_KB.items():
             tw = set(text.lower().split())
-            s  = sum(1 for w in ql.split() if w in tw) / max(len(ql.split()),1)
-            if s > best: best, ans = s, text
-        if ans and best > 0.08: return ans
-        return "I can help with NOVA commands and Python scripting. Type `help` for all commands, or `agent <task>` to let the AI execute OS operations. Install a model with `llm download tinyllama` for full AI."
+            s = sum(1 for w in ql.split() if w in tw) / max(len(ql.split()), 1)
+            if s > best:
+                best, ans = s, text
+        if ans and best > 0.08:
+            return ans
+        return (
+            "I can answer from SOS handles/tags when data exists. "
+            "Try `data put note '…'` then `ask <question>`, or `help`."
+        )
 
 
 SYSTEMS = {
-    "assistant": "You are PyOS NOVA AI. Help manage this Python OS. Be concise and technical.",
-    "agent":     ('You are NOVA Agent. For OS tasks respond with JSON: {"action":"run_command","command":"...","reason":"..."} or {"action":"install_package","package":"...","reason":"..."} or {"action":"create_file","path":"...","content":"...","reason":"..."} or {"action":"none","reason":"..."}. Always confirm before destructive actions.'),
-    "writer":    "Write clean Python 3.11+ code. Return ONLY code, no markdown fences.",
-    "advisor":   "Analyze system metrics. Give 1-2 concise actionable recommendations.",
+    "assistant": (
+        "You are DataPy.os AI. Data is the filesystem; Python is the runtime. "
+        "Prefer handles, tags, and links over classical folders. Be concise."
+    ),
+    "agent": (
+        'You are NOVA Agent. For OS tasks respond with JSON: '
+        '{"action":"run_command","command":"...","reason":"..."} or '
+        '{"action":"none","reason":"..."}. Confirm destructive actions.'
+    ),
+    "writer": "Write clean Python 3.11+ code. Return ONLY code, no markdown fences.",
+    "advisor": "Analyze system metrics. Give 1-2 concise actionable recommendations.",
 }
 
 
-# ── AI Engine — Tiered LLM ────────────────────────────────────────────────────
-# Automatically selects the best available inference tier:
-#
-#   Tier 1  llama-cpp-python  — GGUF model, GPU or CPU, full quality
-#   Tier 2  NanoLLM           — tiny embedding-based responses, fast
-#   Tier 3  RAG               — retrieval-augmented from SOS index
-#
-# The tier is detected at startup and can be overridden with NOVA_NO_AI=1.
-# All tiers expose the same ask(prompt) API so callers don't need to
-# know which tier is active.
-#
+# Tier 1 llama · Tier 2 NanoLLM · Tier 3 RAG from SOS (NOVA_NO_AI=1 forces RAG).
 class AIEngine:
-    """A i engine."""
+    """Tiered local inference with SOS-backed RAG fallback."""
+
     def __init__(self, model_path=None):
-        """Initialise the instance."""
+        """Initialise backends; honour NOVA_NO_AI without model downloads."""
         self._llama = LlamaCppBackend(model_path)
-        self._nano  = NanoLLM()
-        self._rag   = RAGEngine()
-        self._tier  = None
-        self._gpu   = None
-        threading.Thread(target=self._detect, daemon=True).start()
+        self._nano = NanoLLM()
+        self._rag = RAGEngine()
+        self._tier = None
+        self._gpu = None
+        if os.environ.get("NOVA_NO_AI") == "1":
+            self._tier = "rag"
+        else:
+            threading.Thread(target=self._detect, daemon=True).start()
+
+    def bind_store(self, sos=None, dataplane=None) -> None:
+        """Wire SOS/DataPlane into the RAG tier."""
+        self._rag.bind(sos=sos, dataplane=dataplane)
 
     def _detect(self):
-        """Detect the operation and return the result."""
+        """Detect GPU and pick the best available tier."""
+        if os.environ.get("NOVA_NO_AI") == "1":
+            self._tier = "rag"
+            return
         try:
             from ai.gpu import detect_gpu
             self._gpu = detect_gpu()
-        except Exception: pass
-        if self._llama.available: self._tier = "llama-cpp"
-        elif self._nano.load():   self._tier = "nano"
-        else:                     self._tier = "rag"
+        except Exception:
+            pass
+        if self._llama.available:
+            self._tier = "llama-cpp"
+        elif self._nano.load():
+            self._tier = "nano"
+        else:
+            self._tier = "rag"
 
     @property
     def tier(self):
-        """Tier."""
+        """Active tier name."""
         return self._tier or "rag"
 
     @property
     def model_name(self):
-        """Model name."""
+        """Human-readable model / tier label."""
         gpu_tag = ""
         if self._gpu and self._gpu.backend != "cpu" and self.tier == "llama-cpp":
             gpu_tag = f" [{self._gpu.backend.upper()}×{self._gpu.n_gpu_layers}L]"
-        return {"llama-cpp":f"llama-cpp{gpu_tag}","nano":"NanoLLM(numpy)","rag":"RAG"}.get(self.tier,"init...")
+        return {
+            "llama-cpp": f"llama-cpp{gpu_tag}",
+            "nano": "NanoLLM(numpy)",
+            "rag": "RAG(SOS)",
+        }.get(self.tier, "init...")
 
-    def complete(self, prompt, system_key="assistant", temperature=0.7, max_tokens=512, **kw):
-        """Complete.
-
-            Args:
-            prompt: Prompt.
-            system_key: System key, defaults to 'assistant'.
-            temperature: Temperature, defaults to 0.7.
-            max_tokens: Max tokens, defaults to 512.
-            """
+    def complete(self, prompt, system_key="assistant", temperature=0.7,
+                 max_tokens=512, **kw):
+        """Stream completion from the active tier."""
         system = SYSTEMS.get(system_key, SYSTEMS["assistant"])
-        tier   = self.tier
+        tier = self.tier
         if tier == "llama-cpp":
-            yield from self._llama.complete(prompt, system=system, max_tokens=max_tokens, temperature=temperature)
+            yield from self._llama.complete(
+                prompt, system=system, max_tokens=max_tokens,
+                temperature=temperature,
+            )
         elif tier == "nano":
-            yield from self._nano.generate(f"System: {system}\nUser: {prompt}\nAssistant:", max_new=max_tokens, temperature=temperature)
+            yield from self._nano.generate(
+                f"System: {system}\nUser: {prompt}\nAssistant:",
+                max_new=max_tokens, temperature=temperature,
+            )
         else:
             yield from self._rag.complete(prompt, system=system)
 
     def chat(self, messages, system_key="assistant", **kw):
-        """Chat.
-
-            Args:
-            messages: Messages.
-            system_key: System key, defaults to 'assistant'.
-            """
-        prompt = "\n".join(f"{'User' if m['role']=='user' else 'AI'}: {m['content']}" for m in messages)
+        """Multi-turn chat wrapper."""
+        prompt = "\n".join(
+            f"{'User' if m['role'] == 'user' else 'AI'}: {m['content']}"
+            for m in messages
+        )
         yield from self.complete(prompt, system_key=system_key, **kw)
 
-    """Ask.
-
-        Args:
-        prompt: Prompt.
-        """
-    def ask(self, prompt, **kw): return "".join(self.complete(prompt, **kw))
+    def ask(self, prompt, **kw):
+        """One-shot answer string."""
+        return "".join(self.complete(prompt, **kw))
 
     def download_model(self, name="tinyllama"):
-        """Download model to local storage.
-
-            Args:
-            name: Name, defaults to 'tinyllama'.
-            """
+        """Download a GGUF model (skipped when NOVA_NO_AI=1)."""
+        if os.environ.get("NOVA_NO_AI") == "1":
+            raise RuntimeError("model download disabled under NOVA_NO_AI=1")
         path = self._llama.download(name)
-        self._llama.model_path = path; self._llama._llm = None
-        if self._llama.available: self._tier = "llama-cpp"; return True
+        self._llama.model_path = path
+        self._llama._llm = None
+        if self._llama.available:
+            self._tier = "llama-cpp"
+            return True
         return False
 
     def status(self):
         """Return the current status as a dict."""
-        d = {"tier": self.tier, "model": self.model_name, "llama_cpp": self._llama._llm is not None, "nano": self._nano._ready}
+        d = {
+            "tier": self.tier,
+            "model": self.model_name,
+            "llama_cpp": self._llama._llm is not None,
+            "nano": self._nano._ready,
+        }
         if self._gpu:
-            d.update({"gpu_backend": self._gpu.backend, "gpu_name": self._gpu.name,
-                       "gpu_vram": f"{self._gpu.vram_gb}GB", "gpu_layers": self._gpu.n_gpu_layers})
+            d.update({
+                "gpu_backend": self._gpu.backend,
+                "gpu_name": self._gpu.name,
+                "gpu_vram": f"{self._gpu.vram_gb}GB",
+                "gpu_layers": self._gpu.n_gpu_layers,
+            })
         return d

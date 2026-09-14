@@ -80,6 +80,22 @@ class Capability:
         """Return True if this capability is valid (not revoked and not expired)."""
         return not self.revoked and not self.is_expired
 
+    def chain_valid(self, lookup) -> bool:
+        """Return True if this cap and every parent in the chain is valid."""
+        if not self.is_valid:
+            return False
+        token = self.parent_token
+        seen: set[str] = set()
+        while token:
+            if token in seen:
+                return False
+            seen.add(token)
+            parent = lookup(token)
+            if parent is None or not parent.is_valid:
+                return False
+            token = parent.parent_token
+        return True
+
     def has_right(self, right: str) -> bool:
         """Return True if this capability grants the specified right."""
         if not self.is_valid:
@@ -232,14 +248,16 @@ class CapabilityStore:
             bool: True if access is permitted.
         """
         cap = self._cache.get(token)
-        if not cap or not cap.is_valid:
+        if not cap or not cap.chain_valid(self.get):
             return False
-        # Path check
-        if path and cap.target_path != path:
-            # Check if it's a parent path (directory capability)
+        if RIGHT_ADMIN in cap.rights_set or cap.target_path in {"*", "@"}:
+            ok = cap.has_right(right)
+        elif path and cap.target_path != path:
             if not path.startswith(cap.target_path.rstrip("/") + "/"):
                 return False
-        ok = cap.has_right(right)
+            ok = cap.has_right(right)
+        else:
+            ok = cap.has_right(right)
         if ok:
             cap.last_used  = time.time()
             cap.use_count += 1
@@ -264,15 +282,21 @@ class CapabilityStore:
             Capability: The delegated capability, or None if delegation is not allowed.
         """
         parent = self._cache.get(parent_token)
-        if not parent or not parent.can_delegate():
+        if not parent or not parent.can_delegate() or not parent.chain_valid(self.get):
             return None
-        # Can only grant a subset of parent's rights
         delegated_rights = rights & parent.rights_set
+        child_ttl = ttl
+        if parent.expires_at is not None:
+            remaining = parent.expires_at - time.time()
+            if remaining <= 0:
+                return None
+            if child_ttl is None or child_ttl > remaining:
+                child_ttl = remaining
         return self.grant(
             target_path    = parent.target_path,
             rights         = delegated_rights,
             owner          = owner,
-            ttl            = ttl,
+            ttl            = child_ttl,
             delegate_depth = parent.delegate_depth - 1,
             parent_token   = parent_token,
         )
