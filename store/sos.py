@@ -51,12 +51,15 @@ Fixes applied:
 
 from __future__ import annotations
 
+import logging
 import os, time, json, hashlib, sqlite3, threading, uuid
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Tuple, Any
 from functools import lru_cache
 
 from store.migration import SCHEMA_VERSION, ensure_revision_tables
+
+log = logging.getLogger("nova.sos")
 
 LRU_OBJ_SIZE  = 2048   # max cached SObject instances
 LRU_PATH_SIZE = 4096   # max cached path→OID mappings
@@ -752,6 +755,26 @@ class SemanticObjectStore:
             durable=True, queued=False, noop=False, version=version,
         )
         return blob_oid
+
+    def flush(self, barrier: bool = True) -> WriteAck | None:
+        """Drain optional queues and optionally checkpoint the WAL.
+
+        Product writes go through ``write()`` and are durable on return.
+        ``barrier=True`` runs ``PRAGMA wal_checkpoint(TRUNCATE)`` so readers
+        on a reopen see committed pages. Returns ``last_ack`` if any.
+        """
+        waq = getattr(self, "_waq", None)
+        if waq is not None and hasattr(waq, "flush"):
+            try:
+                waq.flush(force=True)
+            except Exception as exc:
+                log.warning("waq flush during barrier failed: %s", exc)
+        if barrier:
+            with self._lock:
+                conn = self._pool.get()
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                conn.commit()
+        return getattr(self, "last_ack", None)
 
     def stat(self, path: str) -> dict:
         """Return handle-scoped metadata from the current revision."""

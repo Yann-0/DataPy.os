@@ -92,36 +92,51 @@ class NovaShell:
         return self.sos.resolve_path(path, self.cwd)
 
     def _prompt(self):
-        """Prompt."""
-        disp = self.cwd.replace(self.env.get("HOME",""), "~")
-        pend = self.kernel.advisor.pending()
+        """Prompt centred on handles, not classical paths."""
+        disp = "@" if self.cwd in {"@", "/", ""} else self.cwd.replace(
+            self.env.get("HOME", ""), "~"
+        )
+        pend = 0
+        try:
+            pend = self.kernel.advisor.pending()
+        except Exception:
+            pend = 0
         badge = col(f" [{pend}!]", "yellow") if pend else ""
-        uc = "red" if self.user=="root" else "green"
-        return f"{col(self.user,uc)}{col('@','dim')}{col('nova','cyan')}{col(':','dim')}{col(disp,'blue')}{badge}{col('$ ','white')}"
+        uc = "red" if self.user == "root" else "green"
+        return (
+            f"{col(self.user, uc)}{col('@', 'dim')}{col('datapy', 'cyan')}"
+            f"{col(':', 'dim')}{col(disp, 'blue')}{badge}{col('$ ', 'white')}"
+        )
 
-    """Err.
-
-        Args:
-        m: M.
-        """
     def _err(self, m): print(col(f"  {m}", "red"), file=sys.stderr)
-    """Ok.
 
-        Args:
-        m: M.
-        """
     def _ok(self,  m): print(col(f"  {m}", "green"))
 
     # ─── run loop ─────────────────────────────────────────────────────────────
     def run(self):
-        """Run the operation."""
-        try:
-            motd = self.sos.read("/etc/motd")
-            print(motd)
-        except: pass
+        """Interactive loop — data OS banner first."""
+        shown = False
+        for path in ("/system/motd", "/etc/motd"):
+            try:
+                print(self.sos.read(path))
+                shown = True
+                break
+            except Exception:
+                continue
+        if not shown:
+            try:
+                welcome = self.kernel.data.get("welcome")
+                print(welcome.content)
+            except Exception:
+                print(col("  DataPy.os — data is the filesystem.", "cyan"))
+                print(col("  Try: data put note 'hello'  |  data find  |  data lock on", "dim"))
 
         print(col(f"  AI: {self.kernel.ai.model_name}", "dim"))
-        print(col(f"  SOS: {len(self.sos.listdir('/'))} top-level objects", "dim"))
+        try:
+            n = len(self.kernel.data.find(limit=5))
+            print(col(f"  DataPlane: ready ({n}+ handles visible)", "dim"))
+        except Exception:
+            print(col("  DataPlane: ready", "dim"))
         print()
 
         while not self._exit:
@@ -416,64 +431,59 @@ class NovaShell:
             "syscalls": self._syscalls,
         }
 
-    # ════ FILESYSTEM ═════════════════════════════════════════════════════════
+    # ════ FILESYSTEM (legacy — prefer data *) ════════════════════════════════
     def _ls(self, args):
-        """Ls.
-
-            Args:
-            args: Args.
-            """
-        flags=""; paths=[]
+        """Legacy path listing — prefer ``data find``."""
+        if not getattr(self, "_legacy_path_warned", False):
+            print(col(
+                "  note: ls is legacy; prefer  data find  /  data find tag=…",
+                "yellow",
+            ))
+            self._legacy_path_warned = True
+        flags = ""
+        paths = []
         for a in args:
-            if a.startswith("-"): flags+=a[1:]
-            else: paths.append(a)
-        if not paths: paths=[self.cwd]
+            if a.startswith("-"):
+                flags += a[1:]
+            else:
+                paths.append(a)
+        if not paths:
+            paths = [self.cwd]
         for path in paths:
             rp = self._resolve(path)
             try:
                 if self.sos.is_file(rp):
-                    print(rp.split("/")[-1]); continue
+                    print(rp.split("/")[-1])
+                    continue
                 children = self.sos.listdir(rp)
-                if "a" not in flags: children = [c for c in children if not c.startswith(".")]
+                if "a" not in flags:
+                    children = [c for c in children if not c.startswith(".")]
                 children.sort()
-                if "l" in flags:
-                    print(f"total {len(children)}")
-                    for c in children:
-                        fp   = rp.rstrip("/")+"/"+c
-                        node = self.sos._inodes.get(fp)
-                        if not node: continue
-                        perm = "drwxr-xr-x" if node.is_dir() else "-rw-r--r--"
-                        tags = self.sos.get_tags(fp)
-                        tstr = " "+" ".join(col(f"#{t}","purple") for t in tags) if tags else ""
-                        nm   = col(c+"/","cyan") if node.is_dir() else c
-                        print(f"{perm} {self.user:8} {node.size:6} {nm}{tstr}")
-                else:
-                    row=""
-                    for c in children:
-                        fp  = rp.rstrip("/")+"/"+c
-                        nd  = self.sos._inodes.get(fp)
-                        nm  = col(c+"/","cyan") if (nd and nd.is_dir()) else c
-                        row += f"{nm:<25}"
-                    print(row)
-            except Exception as e: self._err(str(e))
+                print("  ".join(children) if children else col("  (empty)", "dim"))
+            except Exception as exc:
+                self._err(str(exc))
 
     def _cd(self, args):
-        """Cd.
-
-            Args:
-            args: Args.
-            """
-        t  = args[0] if args else self.env.get("HOME","/")
+        """Legacy directory change — prefer flat handles via ``data``."""
+        if not getattr(self, "_legacy_path_warned", False):
+            print(col(
+                "  note: cd is legacy; DataPy uses flat handles (data get|find)",
+                "yellow",
+            ))
+            self._legacy_path_warned = True
+        t = args[0] if args else self.env.get("HOME", "@")
+        if t in {"@", "/"}:
+            self.cwd = "@"
+            return
         rp = self._resolve(t)
-        if not self.sos.exists(rp): self._err(f"cd: {t}: No such object"); return
-        if not self.sos.is_dir(rp): self._err(f"cd: {t}: Not a directory-object"); return
+        if not self.sos.exists(rp):
+            self._err(f"cd: {t}: No such object")
+            return
+        if not self.sos.is_dir(rp):
+            self._err(f"cd: {t}: Not a directory-object")
+            return
         self.cwd = rp
 
-    """Pwd.
-
-        Args:
-        _:  .
-        """
     def _pwd(self, _): print(self.cwd)
 
     def _mkdir(self, args):

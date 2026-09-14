@@ -86,6 +86,7 @@ class DataPlane:
         self.audit = audit
         self._token: str | None = None
         self._actor = "root"
+        self.last_ack = None
 
     # ── session ─────────────────────────────────────────────────────────────
 
@@ -283,6 +284,7 @@ class DataPlane:
             tags=tag_set,
             meta=meta or {},
         )
+        self.last_ack = getattr(self.sos, "last_ack", None)
         if (
             self.caps is not None
             and existing is None

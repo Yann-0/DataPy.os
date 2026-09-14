@@ -206,6 +206,8 @@ class NovaKernel:
         self.api_server.dataplane = self.data
         self.file_server.host = "127.0.0.1"
         self.file_server.dataplane = self.data
+        if hasattr(self.ai, "bind_store"):
+            self.ai.bind_store(sos=self.sos, dataplane=self.data)
 
         _p("data mgmt")
         # Data management
@@ -340,22 +342,17 @@ class NovaKernel:
             _p(f"seed-early FAILED: {exc}")
 
     def boot(self) -> None:
-        """Start all background services and build the interactive shell.
+        """Start services and build the interactive shell.
 
-        Sequence:
-
-        1. Patch the AI engine with the memory manager (injects remembered
-           context into every LLM call).
-        2. Start the neural search indexer thread.
-        3. Start the proactive health advisor thread.
-        4. Start all four AI agents (sysadmin, coder, researcher, taskmaster).
-        5. Start mDNS peer discovery.
-        6. Register named processes in the process table.
-        7. Instantiate :class:`shell.nova_shell.NovaShell`.
-        8. Load ``~/.nova_rc`` scripting definitions and start the cron
-           scheduler.
+        With ``NOVA_NO_AI=1`` or ``NOVA_LEAN=1``, skip discovery, metrics,
+        agents, advisor, and most SOS monkey-patches — product path is
+        SOS + DataPlane + shell.
         """
         from shell.nova_shell import NovaShell
+
+        lean = os.environ.get("NOVA_NO_AI") == "1" or os.environ.get(
+            "NOVA_LEAN"
+        ) == "1"
 
         def _step(name: str, fn) -> None:
             if os.environ.get("NOVA_BOOT_DEBUG"):
@@ -366,9 +363,9 @@ class NovaKernel:
                 if os.environ.get("NOVA_BOOT_DEBUG"):
                     print(f"[boot] {name} FAILED: {exc}", flush=True)
 
-        # Patch AI with memory context
         _step("ai-memory", lambda: patch_engine_with_memory(self.ai, self.mem))
-        _step("prefetch", lambda: self.prefetch.patch_sos())
+        if not lean:
+            _step("prefetch", lambda: self.prefetch.patch_sos())
         _step("watchdog-reg", lambda: (
             self.watchdog.register(
                 "sos",
@@ -384,48 +381,49 @@ class NovaKernel:
             ),
             self.watchdog.start(),
         ))
-        _step("discovery", lambda: self.discovery.start())
-        _step("metrics", lambda: self.observe.start_metrics_server(9090))
-        _step("health", lambda: self.health.start())
-        # Performance patches
-        _step("waq", lambda: patch_sos_with_waq(self.sos))
-        _step("events", lambda: patch_sos_with_events(self.sos, self.event_bus))
-        _step("compress", lambda: patch_sos_with_compression(self.sos))
-        _step("stream", lambda: setattr(
-            self, "stream", StreamProcessor(self.sos, self.event_bus)))
-        _step("view_mgr", lambda: setattr(
-            self, "view_mgr", ViewManager(self.sos, self.event_bus)))
-        _step("bloom-patch", lambda: self.bloom.patch_sos())
-        _step("schema", lambda: self.schema.patch_sos())
-        _step("kvcache", lambda: patch_ai_with_kvcache(self.ai, self.sos))
-        _step("schema_reg", lambda: self.schema_reg.patch_sos())
-        _step("views-patch", lambda: (
-            self.views.patch_sos() if hasattr(self.views, "patch_sos") else None
-        ))
-        _step("eventsrc", lambda: patch_sos_with_event_sourcing(self.sos, self.es_log))
-        _step("timelock", lambda: self.timelock.patch_sos())
-        _step("classifier", lambda: self.classifier.patch_sos())
-        _step("audit", lambda: patch_sos_with_audit(self.sos, self.audit))
-        _step("lineage", lambda: patch_sos_with_lineage(self.sos, self.lineage))
+        if not lean:
+            _step("discovery", lambda: self.discovery.start())
+            _step("metrics", lambda: self.observe.start_metrics_server(9090))
+            _step("health", lambda: self.health.start())
+            _step("waq", lambda: patch_sos_with_waq(self.sos))
+            _step("events", lambda: patch_sos_with_events(self.sos, self.event_bus))
+            _step("compress", lambda: patch_sos_with_compression(self.sos))
+            _step("stream", lambda: setattr(
+                self, "stream", StreamProcessor(self.sos, self.event_bus)))
+            _step("view_mgr", lambda: setattr(
+                self, "view_mgr", ViewManager(self.sos, self.event_bus)))
+            _step("bloom-patch", lambda: self.bloom.patch_sos())
+            _step("schema", lambda: self.schema.patch_sos())
+            _step("kvcache", lambda: patch_ai_with_kvcache(self.ai, self.sos))
+            _step("schema_reg", lambda: self.schema_reg.patch_sos())
+            _step("views-patch", lambda: (
+                self.views.patch_sos() if hasattr(self.views, "patch_sos") else None
+            ))
+            _step("eventsrc", lambda: patch_sos_with_event_sourcing(self.sos, self.es_log))
+            _step("timelock", lambda: self.timelock.patch_sos())
+            _step("classifier", lambda: self.classifier.patch_sos())
+            _step("audit", lambda: patch_sos_with_audit(self.sos, self.audit))
+            _step("lineage", lambda: patch_sos_with_lineage(self.sos, self.lineage))
+            _step("search", lambda: self.search.start())
+            _step("advisor", lambda: self.advisor.start())
+            _step("agents", lambda: self.agents.start_all())
 
-        # Start background services (best-effort on constrained hosts)
-        _step("search", lambda: self.search.start())
-        _step("advisor", lambda: self.advisor.start())
-        _step("agents", lambda: self.agents.start_all())
-
-        # Register processes
-        for pid, name in [(1,"nova-kernel"),(2,"nova-indexer"),
-                          (3,"nova-advisor"),(4,"nova-agents"),(5,"nova-mdns")]:
+        for pid, name in [(1, "nova-kernel"), (5, "nova-shell")]:
             self.procs.spawn(name, pid=pid, user="root", cmd=f"[{name}]")
+        if not lean:
+            for pid, name in [
+                (2, "nova-indexer"), (3, "nova-advisor"),
+                (4, "nova-agents"), (6, "nova-mdns"),
+            ]:
+                self.procs.spawn(name, pid=pid, user="root", cmd=f"[{name}]")
 
-        # Build shell and load scripting
         _step("shell", lambda: setattr(self, "shell", NovaShell(self)))
         if self.shell:
             self.agent.shell = self.shell
             self.reviewer.advisor = self.advisor
-            _step("rc", lambda: self.scripting.load_rc(self.shell))
-            _step("cron", lambda: self.scripting.start_cron(self.shell))
-        # Core handles seeded in __init__ via raw SOS write (pre-patch).
+            if not lean:
+                _step("rc", lambda: self.scripting.load_rc(self.shell))
+                _step("cron", lambda: self.scripting.start_cron(self.shell))
 
     def shutdown(self) -> None:
         """Flush SOS WAL and stop background services cleanly."""

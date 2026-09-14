@@ -220,66 +220,12 @@ class WriteAheadQueue:
 
 
 def patch_sos_with_waq(sos: "SemanticObjectStore") -> WriteAheadQueue:
+    """Attach a WAQ for metrics/flush only — do not replace ``sos.write``.
+
+    Product durability is ``sos.write()`` with unique revisions and
+    ``WriteAck(durable=True)`` after COMMIT. Legacy batch INSERT OR IGNORE
+    must not wrap the revision path.
     """
-    Patch the SOS to use the write-ahead batch queue.
-
-    Replaces sos.store() with a version that enqueues the write
-    and immediately updates the in-memory caches so reads remain
-    consistent without waiting for the flush.
-
-    Args:
-        sos: The SemanticObjectStore to patch.
-
-    Returns:
-        WriteAheadQueue: The active queue instance.
-    """
-    waq        = WriteAheadQueue(sos)
-    orig_store = sos.store
-
-    def _batched_store(content, kind="text", meta=None, tags=None,
-                        links=None, parent_oid=None):
-        """Enqueue write immediately, update cache synchronously."""
-        if isinstance(content, str):
-            content = content.encode()
-
-        import hashlib as _hl
-        oid   = _hl.sha256(content).hexdigest()[:32]
-        meta  = meta  or {}
-        tags  = [t.lower().strip() for t in (tags or []) if t.strip()]
-        links = links or []
-
-        version = 1
-        if parent_oid:
-            parent = sos.get(parent_oid)
-            if parent:
-                version = parent.version + 1
-
-        import time as _t
-        now = _t.time()
-
-        from store.sos import SObject
-        obj = SObject(
-            oid=oid, content=content, kind=kind,
-            meta=meta, tags=tags, links=links,
-            parent_oid=parent_oid, version=version,
-            created_at=now, size=len(content),
-        )
-
-        op = _WriteOp(
-            oid=oid, content=content, kind=kind,
-            meta_json=json.dumps(meta),
-            tags_json=json.dumps(tags),
-            links_json=json.dumps(links),
-            parent_oid=parent_oid, version=version,
-            created_at=now, size=len(content),
-            tags=tags,
-        )
-        waq.enqueue(op)
-
-        # Immediately update in-memory caches for read consistency
-        sos._obj_cache.set(oid, obj)
-        return oid
-
-    waq        = WriteAheadQueue(sos)
-    sos._waq  = waq
+    waq = WriteAheadQueue(sos)
+    sos._waq = waq
     return waq
