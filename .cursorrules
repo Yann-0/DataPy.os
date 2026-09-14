@@ -3,22 +3,23 @@
 # These rules give Cursor complete context. Read before writing any code.
 
 ## Project identity
-DataPy.os is a data-native OS: **data + Python + AI**, not a classical folder tree.
-Objects are addressed by OID, flat handles, tags, and links. Collections are
-semantic (tags/graph), never parent directories.
+DataPy.os is a data-native OS: **data + Python + AI**, NOT another Linux distro
+and NOT a classical folder tree. Objects are addressed by OID, revisions, flat
+handles, tags, and links. Collections are semantic (tags/graph), never parent
+directories. Product doc: docs/PRODUCT.md.
 
-Stack:
-  Host / Pi / UEFI
-    → Python runtime
-    → NovaKernel      (kernel/nova.py)
-    → DataPlane       (store/dataplane.py)  # secure CRUD — primary surface
-    → SOS             (store/sos.py)        # content-addressed SQLite WAL
+Product stack (optimize here first):
+  NovaKernel      (kernel/nova.py)
+    → DataPlane   (store/dataplane.py)  # secure CRUD — primary surface
+    → SOS         (store/sos.py)        # content-addressed SQLite WAL = filesystem
     → Shell / AI
 
+Bring-up only (not the product): host CPython, Pi Linux+Python PID-1, experimental UEFI.
+
 ## Target platforms
-- Raspberry Pi 5 (ARM64) — primary, boots from USB
-- x86-64 UEFI PC — secondary
-- Any machine: `python3 main.py` (dev mode)
+- Any machine: `python3 main.py` (primary development surface)
+- Raspberry Pi 5 — hardware bring-up so Python can be PID-1 (not a Linux OS goal)
+- Firmware-native UEFI — experimental only
 
 ## The ONE rule: never touch disk directly
 ALWAYS use `sos.write(path, content)` and `sos.read(path)`.
@@ -134,8 +135,10 @@ NOVA_NO_AI unset       Set 1 to force RAG tier (fast startup)
 NOVA_LOG   info        debug / info / warning / error
 
 ## What NOT to do
-- NEVER use open() for persistent data — always sos.write()
+- NEVER use open() for persistent data — always sos.write() / DataPlane
 - NEVER use print() for logging — use logging.getLogger()
 - NEVER hardcode ~/.nova paths — use os.environ.get("NOVA_DATA")
 - NEVER remove module docstrings (CI gate)
-- NEVER add Linux-only syscalls (code runs bare-metal on Pi)
+- NEVER treat Linux userspace growth as the product; keep Linux I/O in boot/build adapters
+- NEVER claim firmware-native UEFI is a working image without real acceptance
+- Prefer SOS/DataPlane/kernel/AI optimizations over new Unix utilities

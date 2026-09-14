@@ -1,26 +1,31 @@
-# PyOS NOVA — Architecture Guide
+# DataPy.os — Architecture Guide
 
 ## Overview
 
-DataPy.os is a data-native operating system: **data + Python + AI**.
-On a Raspberry Pi 5 the supported userspace is Linux + Python PID-1
-(`boot/pyinit.py`). On a developer workstation, `python3 main.py` starts
-the same kernel in-process.
+DataPy.os is a **data-native OS**: **data + Python + AI**. It is not another
+Linux distribution. Product identity and roadmap: `docs/PRODUCT.md`.
 
-Firmware-native UEFI (Python as an EFI application, no Linux kernel) is
-an **experimental** research path. It is not a supported runtime until it
-passes its own real-execution acceptance.
+The OS is defined by three layers (in priority order):
+
+1. **SOS** — content-addressed blobs, unique revisions, tags, links (the filesystem)
+2. **DataPlane** — authorized CRUD over flat handles (primary I/O surface)
+3. **NovaKernel** — Python kernel that owns subsystems, shell, and AI
+
+Bring-up (host CPython, Pi Linux kernel + Python PID-1, experimental UEFI)
+only starts Python. Optimizations belong in SOS / DataPlane / kernel / AI.
 
 ```
-Supported: Raspberry Pi 5 Linux kernel + Python userspace / PID-1
-            or host CPython 3.11+
+NovaKernel (kernel/nova.py)
       ↓
-boot/pyinit.py         PID 1 on Linux — mounts, starts kernel
-kernel/nova.py         NovaKernel — owns all subsystems
-store/dataplane.py     Authorized CRUD (primary surface)
-store/sos.py           Content-addressed SQLite WAL
-shell/nova_shell.py    Interactive shell
+DataPlane (store/dataplane.py)   ← primary surface
+      ↓
+SOS (store/sos.py)               ← the filesystem
+      ↓
+Shell / AI / APIs
 ```
+
+Host development: `python3 main.py`. Pi image: Linux is a thin host so
+`boot/pyinit.py` can run as PID-1. Firmware-native UEFI remains experimental.
 
 ---
 
@@ -28,9 +33,9 @@ shell/nova_shell.py    Interactive shell
 
 ### Semantic Object Store (SOS)
 
-The SOS is NOVA's filesystem, database, and version-control system in one.
-Every object is content-addressed by SHA-256 of its content, stored in
-SQLite WAL mode, and automatically versioned.
+The SOS is DataPy's filesystem, database, and version-control system in one.
+Blobs are content-addressed; each write creates a unique revision. Handles
+point at revision heads. Collections are tags and graph links — not folders.
 
 ```
 /store/sos.py              Core store: write, read, resolve, search
@@ -108,21 +113,28 @@ secrets. The Merkle-chained ledger provides tamper-evident audit trails.
 
 ---
 
-## Boot Sequence (Linux / Pi 5 — supported design)
+## Bring-up (not the product)
+
+### Host (primary development)
 
 ```
-1. Raspberry Pi firmware loads the Linux kernel + initramfs from FAT boot
-2. PID 1 is Python (boot/pyinit.py) inside the initramfs
-3. pyinit mounts proc/sys/dev, then the labelled NOVA_DATA ext4 partition
-4. pyinit starts NovaKernel
-5. NovaKernel initialises SOS → DataPlane → shell / optional REST
-6. Persistence is the labelled NOVA_DATA filesystem, not an unformatted 0x83 slice
+python main.py --no-ai
+  → NovaKernel → SOS + DataPlane → shell / --cmd / optional REST
 ```
 
-Firmware-native UEFI boot (PE stub → python3.efi) is experimental and is not
-this sequence. A host ELF converted to PE is not a native runtime.
+Persistent application data is always under `NOVA_DATA` via SOS, never ad-hoc
+`open()` for OS objects.
 
-Host development skips firmware and runs `python main.py` against `NOVA_DATA`.
+### Pi 5 (hardware bring-up only)
+
+```
+1. Firmware loads a Linux kernel + initramfs (transport only)
+2. PID 1 is Python (boot/pyinit.py)
+3. Mount labelled NOVA_DATA, start NovaKernel
+4. SOS / DataPlane / shell — same product as on the host
+```
+
+Firmware-native UEFI is experimental and is not a supported runtime.
 
 ---
 
